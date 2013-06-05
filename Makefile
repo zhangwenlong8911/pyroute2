@@ -85,3 +85,5 @@ dist: clean force-version
 install: clean force-version
 	${python} setup.py install ${root} ${lib}
 
+rpm: dist
+	rpmbuild -ta dist/*tar.gz
