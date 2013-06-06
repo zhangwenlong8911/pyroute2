@@ -28,7 +28,7 @@ progress.
 %{__python} setup.py install --root $RPM_BUILD_ROOT
 
 %files
-%doc README* LICENSE
+%doc STATUS* README* LICENSE
 %{python_sitelib}/%{pkgname}*
 
 %changelog
