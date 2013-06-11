@@ -2,7 +2,7 @@
 
 Name: python-%{pkgname}
 Version: 0.1.9
-Release: 1%{?dist}
+Release: 2%{?dist}
 Summary: Pure Python netlink library
 License: GPLv2+
 Group: Development/Languages
@@ -32,6 +32,9 @@ progress.
 %{python_sitelib}/%{pkgname}*
 
 %changelog
+* Tue Jun 11 2013 Peter V. Saveliev <peet@redhat.com> 0.1.9-2
+- fedpkg import fix
+
 * Tue Jun 11 2013 Peter V. Saveliev <peet@redhat.com> 0.1.9-1
 - several races fixed
 - Python 2.6 compatibility issues fixed
