@@ -5,13 +5,13 @@ from pyroute2 import IPRoute
 from pyroute2.netlink import NetlinkError
 from multiprocessing import Event
 from multiprocessing import Process
+from utils import grep
 from utils import require_user
 from utils import get_ip_addr
 from utils import get_ip_link
 from utils import get_ip_route
 from utils import create_link
-from utils import setup_dummy
-from utils import remove_dummy
+from utils import remove_link
 
 
 def _run_remote_client(url, func, key=None, cert=None, ca=None):
@@ -65,19 +65,19 @@ class TestSetup(object):
         url = url or 'unix://\0nose_tests_socket'
         ip = IPRoute()
         _assert_uplinks(ip, 1)
-        _assert_servers(ip, 1)
+        _assert_servers(ip, 0)
         _assert_clients(ip, 1)
         ip.serve(url, key=key, cert=cert, ca=ca)
         _assert_uplinks(ip, 1)
-        _assert_servers(ip, 2)
+        _assert_servers(ip, 1)
         _assert_clients(ip, 1)
         ip.shutdown_servers(url)
         _assert_uplinks(ip, 1)
-        _assert_servers(ip, 1)
+        _assert_servers(ip, 0)
         _assert_clients(ip, 1)
         ip.shutdown_sockets()
         _assert_uplinks(ip, 0)
-        _assert_servers(ip, 1)
+        _assert_servers(ip, 0)
         _assert_clients(ip, 1)
         ip.release()
 
@@ -148,26 +148,21 @@ class TestSetupUplinks(object):
 
 class TestData(object):
 
-    @classmethod
-    def setup_class(cls):
-        setup_dummy()
-
-    @classmethod
-    def teardown_class(cls):
-        remove_dummy()
-
     def setup(self):
+        create_link('dummyX', 'dummy')
         self.ip = IPRoute()
         self.dev = self.ip.link_lookup(ifname='dummyX')
 
     def teardown(self):
         self.ip.release()
+        remove_link('dummyX')
+        remove_link('bala')
 
     def test_add_addr(self):
         require_user('root')
         dev = self.dev[0]
-        self.ip.addr('add', dev, address='172.16.16.1', mask=24)
-        assert '172.16.16.1/24' in get_ip_addr()
+        self.ip.addr('add', dev, address='172.16.0.1', mask=24)
+        assert '172.16.0.1/24' in get_ip_addr()
 
     def test_remove_link(self):
         require_user('root')
@@ -178,6 +173,19 @@ class TestData(object):
         except NetlinkError:
             pass
         assert len(self.ip.link_lookup(ifname='bala')) == 0
+
+    def test_route(self):
+        require_user('root')
+        create_link('bala', 'dummy')
+        dev = self.ip.link_lookup(ifname='bala')[0]
+        self.ip.link('set', index=dev, state='up')
+        self.ip.addr('add', dev, address='172.16.0.2', mask=24)
+        self.ip.route('add',
+                      prefix='172.16.1.0',
+                      mask=24,
+                      gateway='172.16.0.1')
+        assert grep('ip route show', pattern='172.16.1.0/24.*172.16.0.1')
+        remove_link('bala')
 
     def test_updown_link(self):
         require_user('root')
@@ -226,6 +234,7 @@ class TestData(object):
 class TestRemoteData(TestData):
 
     def setup(self):
+        create_link('dummyX', 'dummy')
         url = 'unix://\0%s' % (uuid.uuid4())
         allow_connect = Event()
         target = Process(target=_run_remote_uplink,
@@ -241,6 +250,7 @@ class TestSSLData(TestData):
     ssl_proto = 'ssl'
 
     def setup(self):
+        create_link('dummyX', 'dummy')
         url = 'unix+%s://\0%s' % (self.ssl_proto, uuid.uuid4())
         allow_connect = Event()
         target = Process(target=_run_remote_uplink,

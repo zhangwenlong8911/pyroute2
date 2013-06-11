@@ -1,4 +1,5 @@
 import os
+import re
 import pwd
 import subprocess
 from nose.plugins.skip import SkipTest
@@ -12,7 +13,14 @@ def require_user(user):
 def remove_link(name):
     if os.getuid() != 0:
         return
-    subprocess.call(['ip', 'link', 'del', 'dev', name])
+    with open(os.devnull, 'w') as fnull:
+        subprocess.call(['ip', 'link', 'del', 'dev', name],
+                        stdout=fnull,
+                        stderr=fnull)
+    while True:
+        links = get_ip_link()
+        if name not in links:
+            break
 
 
 def create_link(name, kind):
@@ -20,24 +28,28 @@ def create_link(name, kind):
         return
     subprocess.call(['ip', 'link', 'add', 'dev', name, 'type', kind])
 
+    for i in range(20):
+        links = get_ip_link()
+        if name in links:
+            return
 
-def setup_dummy():
-    if os.getuid() != 0:
-        return
-    create_link('dummyX', 'dummy')
-    for i in range(1, 20):
-        ip = '172.16.13.%i/24' % (i)
-        subprocess.call(['ip', 'addr', 'add', 'dev', 'dummyX', ip])
-
-
-def remove_dummy():
-    remove_link('dummyX')
+    raise Exception("interface not created")
 
 
 def _check_output(*argv):
     # we can not use check_output, as it does not exist in 2.6
     process = subprocess.Popen(argv, stdout=subprocess.PIPE)
     return process.communicate()[0].split('\n')
+
+
+def grep(command, pattern=None):
+    out = _check_output(*command.split())
+    ret = []
+    reg = re.compile(pattern)
+    for string in out:
+        if reg.search(string):
+            ret.append(string)
+    return ret
 
 
 def get_ip_addr(interface=None):
@@ -59,7 +71,7 @@ def get_ip_link():
     for string in out:
         fields = string.split()
         if len(fields) >= 2:
-            ret.append([fields[1][:-1]])
+            ret.append(fields[1][:-1])
     return ret
 
 
