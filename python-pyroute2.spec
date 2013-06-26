@@ -1,8 +1,8 @@
 %global pkgname pyroute2
 
 Name: python-%{pkgname}
-Version: 0.1.9
-Release: 2%{?dist}
+Version: 0.1.10
+Release: 1%{?dist}
 Summary: Pure Python netlink library
 License: GPLv2+
 Group: Development/Languages
@@ -32,6 +32,12 @@ progress.
 %{python_sitelib}/%{pkgname}*
 
 %changelog
+* Tue Jun 26 2013 Peter V. Saveliev <peet@redhat.com> 0.1.10-1
+- fd and threads leaks fixed
+- shutdown sequence fixed (release() calls)
+- ipdb: interface removal
+- ipdb: fail on transaction sync timeout
+
 * Tue Jun 11 2013 Peter V. Saveliev <peet@redhat.com> 0.1.9-2
 - fedpkg import fix
 
