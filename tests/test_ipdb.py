@@ -1,9 +1,10 @@
 from pyroute2 import IPDB
-from pyroute2.netlink.ipdb import IPDBError
-from pyroute2.netlink.ipdb import IPDBModeError
-from pyroute2.netlink.ipdb import IPDBUnrecoverableError
-from pyroute2.netlink.ipdb import IPDBTransactionRequired
 from pyroute2.netlink import NetlinkError
+from pyroute2.netlink.ipdb import clear_fail_bit
+from pyroute2.netlink.ipdb import set_fail_bit
+from pyroute2.netlink.ipdb import set_ancient
+from pyroute2.netlink.ipdb import _FAIL_COMMIT
+from pyroute2.netlink.ipdb import _FAIL_ROLLBACK
 from utils import create_link
 from utils import remove_link
 from utils import require_user
@@ -24,8 +25,11 @@ class TestExplicit(object):
 
     def teardown(self):
         self.ip.release()
+        remove_link('bala_port0')
+        remove_link('bala_port1')
         remove_link('dummyX')
         remove_link('bala')
+        remove_link('bv101')
 
     def test_simple(self):
         assert self.ip.keys() > 0
@@ -116,6 +120,119 @@ class TestExplicit(object):
         self.ip.dummyX.commit()
         assert not (self.ip.dummyX.flags & 1)
 
+    def test_ancient_bridge(self):
+        require_user('root')
+
+        # create ports
+        with self.ip.create(kind='dummy', ifname='bala_port0'):
+            pass
+        with self.ip.create(kind='dummy', ifname='bala_port1'):
+            pass
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+
+        set_ancient(True)
+
+        # create bridge
+        try:
+            with self.ip.create(kind='bridge', ifname='bala') as i:
+                i.add_ip('172.16.0.1/24')
+                i.add_ip('172.16.0.2/24')
+                i.add_port(self.ip.bala_port0)
+                i.add_port(self.ip.bala_port1)
+        finally:
+            set_ancient(False)
+
+        assert 'bala' in self.ip
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+        assert ('172.16.0.1', 24) in self.ip.bala.ipaddr
+        assert ('172.16.0.2', 24) in self.ip.bala.ipaddr
+        assert self.ip.bala_port0.index in self.ip.bala.ports
+        assert self.ip.bala_port1.index in self.ip.bala.ports
+
+    def test_cfail_rollback(self):
+        require_user('root')
+
+        # create ports
+        with self.ip.create(kind='dummy', ifname='bala_port0'):
+            pass
+        with self.ip.create(kind='dummy', ifname='bala_port1'):
+            pass
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+
+        # commits should fail
+        clear_fail_bit(_FAIL_COMMIT)
+        clear_fail_bit(_FAIL_ROLLBACK)
+        try:
+            # create bridge
+            with self.ip.create(kind='bridge', ifname='bala') as i:
+                i.add_ip('172.16.0.1/24')
+                i.add_ip('172.16.0.2/24')
+                i.add_port(self.ip.bala_port0)
+                i.add_port(self.ip.bala_port1)
+
+        except RuntimeError:
+            pass
+
+        finally:
+            # set bit again
+            set_fail_bit(_FAIL_COMMIT)
+            set_fail_bit(_FAIL_ROLLBACK)
+
+        # expected results:
+        # 1. interface created
+        # 2. no addresses
+        # 3. no ports
+        assert 'bala' in self.ip
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+        assert ('172.16.0.1', 24) not in self.ip.bala.ipaddr
+        assert ('172.16.0.2', 24) not in self.ip.bala.ipaddr
+        assert self.ip.bala_port0.index not in self.ip.bala.ports
+        assert self.ip.bala_port1.index not in self.ip.bala.ports
+
+    def test_cfail_commit(self):
+        require_user('root')
+
+        # create ports
+        with self.ip.create(kind='dummy', ifname='bala_port0'):
+            pass
+        with self.ip.create(kind='dummy', ifname='bala_port1'):
+            pass
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+
+        # commits should fail
+        clear_fail_bit(_FAIL_COMMIT)
+        try:
+            # create bridge
+            with self.ip.create(kind='bridge', ifname='bala') as i:
+                i.add_ip('172.16.0.1/24')
+                i.add_ip('172.16.0.2/24')
+                i.add_port(self.ip.bala_port0)
+                i.add_port(self.ip.bala_port1)
+
+        except AssertionError:
+            pass
+
+        finally:
+            # set bit again
+            set_fail_bit(_FAIL_COMMIT)
+
+        # expected results:
+        # 1. interface created
+        # 2. no addresses
+        # 3. no ports
+        assert 'bala' in self.ip
+        assert 'bala_port0' in self.ip
+        assert 'bala_port1' in self.ip
+        assert ('172.16.0.1', 24) not in self.ip.bala.ipaddr
+        assert ('172.16.0.2', 24) not in self.ip.bala.ipaddr
+        assert self.ip.bala_port0.index not in self.ip.bala.ports
+        assert self.ip.bala_port1.index not in self.ip.bala.ports
+
     def test_create_fail(self):
         require_user('root')
         assert 'bala' not in self.ip
@@ -139,18 +256,21 @@ class TestExplicit(object):
         i.commit()
         assert ('172.16.0.1', 24) in self.ip.bala.ipaddr
         assert '172.16.0.1/24' in get_ip_addr(interface='bala')
-        remove_link('bala')
 
-    def test_create_context(self):
+    def test_create_and_remove(self):
         require_user('root')
         assert 'bala' not in self.ip
+
         with self.ip.create(kind='dummy', ifname='bala') as i:
             i.add_ip('172.16.0.1/24')
         assert ('172.16.0.1', 24) in self.ip.bala.ipaddr
         assert '172.16.0.1/24' in get_ip_addr(interface='bala')
-        remove_link('bala')
 
-    def test_create_bond(self):
+        with self.ip.bala as i:
+            i.remove()
+        assert 'bala' not in self.ip
+
+    def _create_master(self, kind):
         require_user('root')
         assert 'bala' not in self.ip
         assert 'bala_port0' not in self.ip
@@ -159,7 +279,7 @@ class TestExplicit(object):
         self.ip.create(kind='dummy', ifname='bala_port0').commit()
         self.ip.create(kind='dummy', ifname='bala_port1').commit()
 
-        with self.ip.create(kind='bond', ifname='bala') as i:
+        with self.ip.create(kind=kind, ifname='bala') as i:
             i.add_port(self.ip.bala_port0)
             i.add_port(self.ip.bala_port1)
             i.add_ip('172.16.0.1/24')
@@ -179,9 +299,11 @@ class TestExplicit(object):
         assert self.ip.bala_port0.if_master is None
         assert self.ip.bala_port1.if_master is None
 
-        remove_link('bala_port0')
-        remove_link('bala_port1')
-        remove_link('bala')
+    def test_create_bridge(self):
+        self._create_master('bridge')
+
+    def test_create_bond(self):
+        self._create_master('bond')
 
     def test_create_vlan(self):
         require_user('root')
@@ -196,8 +318,6 @@ class TestExplicit(object):
                        vlan_id=101).commit()
 
         assert self.ip.bv101.if_master == self.ip.bala.index
-        remove_link('bv101')
-        remove_link('bala')
 
     def test_remove_secondaries(self):
         require_user('root')
@@ -225,8 +345,6 @@ class TestExplicit(object):
         assert '172.16.0.1/24' not in get_ip_addr(interface='bala')
         assert '172.16.0.2/24' not in get_ip_addr(interface='bala')
 
-        remove_link('bala')
-
 
 class TestImplicit(TestExplicit):
     mode = 'implicit'
@@ -246,7 +364,7 @@ class TestDirect(object):
         try:
             with self.ip.lo as i:
                 i.down()
-        except IPDBModeError:
+        except TypeError:
             pass
 
     def test_updown(self):
@@ -263,13 +381,13 @@ class TestDirect(object):
     def test_exceptions_last(self):
         try:
             self.ip.lo.last()
-        except IPDBTransactionRequired:
+        except TypeError:
             pass
 
     def test_exception_review(self):
         try:
             self.ip.lo.review()
-        except IPDBTransactionRequired:
+        except TypeError:
             pass
 
 
@@ -292,7 +410,7 @@ class TestMisc(object):
         ip.ip._sockets = tuple()
         try:
             ip.lo.reload()
-        except IPDBUnrecoverableError:
+        except IOError:
             pass
         del s
         ip.ip.release()
@@ -340,7 +458,7 @@ class TestMisc(object):
             # transaction required
             try:
                 i.lo.up()
-            except IPDBTransactionRequired:
+            except TypeError:
                 pass
 
         with IPDB(mode='implicit') as i:
@@ -355,5 +473,5 @@ class TestMisc(object):
             # transaction mode not supported
             try:
                 i.lo.up()
-            except IPDBError:
+            except TypeError:
                 pass

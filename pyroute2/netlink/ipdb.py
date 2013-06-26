@@ -13,12 +13,11 @@ Quick start:
     ip['bala'].up()
 '''
 import uuid
-import logging
 import platform
 import threading
+from Queue import Empty
 from socket import AF_INET
 from socket import AF_INET6
-from Queue import Empty
 from pyroute2.common import Dotkeys
 from pyroute2.netlink import NetlinkError
 from pyroute2.netlink.iproute import IPRoute
@@ -29,30 +28,32 @@ nla_fields.append('flags')
 nla_fields.append('mask')
 nla_fields.append('change')
 nla_fields.append('state')
+nla_fields.append('removal')
 
 
 _ANCIENT_PLATFORM = platform.dist()[:2] == ('redhat', '6.4')
+# How long should we wait on EACH commit() checkpoint: for ipaddr,
+# ports etc. That's not total commit() timeout.
+_SYNC_TIMEOUT = 3
+
+_FAIL_COMMIT = 0b00000001
+_FAIL_ROLLBACK = 0b00000010
+_FAIL_MASK = 0b11111111
 
 
-class IPDBError(Exception):
-    message = None
-
-    def __init__(self, message=None, error=None):
-        message = message or self.message
-        Exception.__init__(self, message)
-        self.cause = error
+def clear_fail_bit(bit):
+    global _FAIL_MASK
+    _FAIL_MASK &= ~(_FAIL_MASK & bit)
 
 
-class IPDBUnrecoverableError(IPDBError):
-    message = 'unrecoverable IPDB error, restart the instance'
+def set_fail_bit(bit):
+    global _FAIL_MASK
+    _FAIL_MASK |= bit
 
 
-class IPDBTransactionRequired(IPDBError):
-    message = 'begin() a transaction first'
-
-
-class IPDBModeError(IPDBError):
-    message = 'wrong transaction mode for the operation'
+def set_ancient(flag):
+    global _ANCIENT_PLATFORM
+    _ANCIENT_PLATFORM = flag
 
 
 def get_addr_nla(msg):
@@ -76,26 +77,27 @@ class LinkedSet(set):
 
     def __init__(self, *argv, **kwarg):
         set.__init__(self, *argv, **kwarg)
-        self.lock = threading.Lock()
-        self.target = threading.Condition()
+        self.lock = threading.RLock()
+        self.target = threading.Event()
         self._ct = None
         self.raw = {}
         self.links = []
 
     def set_target(self, value):
-        if value is None:
-            self._ct = None
-        elif isinstance(value, (list, tuple, set)):
-            self._ct = set(value)
-        else:
-            raise TypeError('unsupported target type')
+        with self.lock:
+            if value is None:
+                self._ct = None
+                self.target.clear()
+            else:
+                self._ct = set(value)
+                self.target.clear()
 
     def check_target(self):
-        with self.target:
+        with self.lock:
             if self._ct is not None:
                 if self == self._ct:
                     self._ct = None
-                    self.target.notify_all()
+                    self.target.set()
 
     def add(self, key, raw=None):
         with self.lock:
@@ -170,13 +172,13 @@ def update(f):
                 # 3. require open transaction for 'explicit' type
                 elif self._mode == 'explicit':
                     if not self._tids:
-                        raise IPDBTransactionRequired()
+                        raise TypeError('start a transaction first')
                 # 4. transactions can not require transactions :)
                 elif self._mode == 'snapshot':
                     direct = True
                 # do not support other modes
                 else:
-                    raise IPDBError('transaction mode not supported')
+                    raise TypeError('transaction mode not supported')
                 # now that the transaction _is_ open
             f(self, direct, *argv, **kwarg)
 
@@ -218,7 +220,7 @@ class IPLinkRequest(dict):
             dict.__setitem__(self, key, value)
 
 
-class interface(Dotkeys):
+class Interface(Dotkeys):
     '''
     Objects of this class represent network interface and
     all related objects:
@@ -239,7 +241,7 @@ class interface(Dotkeys):
     exception will be raised. Failed transaction review
     will be attached to the exception.
     '''
-    def __init__(self, dev=None, ipr=None, parent=None, mode='direct'):
+    def __init__(self, ipr=None, parent=None, mode='direct'):
         '''
         One can use interface objects standalone as
         well as in connection with ipdb object. Standalone
@@ -280,8 +282,6 @@ class interface(Dotkeys):
             for i in ('state', 'change', 'mask'):
                 del self[i]
         # 8<-----------------------------------
-        if dev is not None:
-            self.load(dev)
 
     def pick(self, detached=True):
         '''
@@ -295,7 +295,7 @@ class interface(Dotkeys):
         used as transactions.
         '''
         with self._write_lock:
-            res = interface(ipr=self.ip, mode='snapshot')
+            res = Interface(ipr=self.ip, mode='snapshot')
             for key in tuple(self.keys()):
                 if key in nla_fields:
                     res[key] = self[key]
@@ -309,7 +309,7 @@ class interface(Dotkeys):
     def __sub__(self, pif):
         '''
         '''
-        res = interface(ipr=self.ip, mode='snapshot')
+        res = Interface(ipr=self.ip, mode='snapshot')
         with self._direct_state:
             # simple keys
             for key in self:
@@ -334,7 +334,7 @@ class interface(Dotkeys):
     def __enter__(self):
         # FIXME: use a bitmask?
         if self._mode not in ('implicit', 'explicit'):
-            raise IPDBModeError()
+            raise TypeError('context managers require a transactional mode')
         if not self._tids:
             self.begin()
         return self
@@ -398,7 +398,10 @@ class interface(Dotkeys):
                 if item in self:
                     del self[item]
 
-            self._load_event.set()
+            self.sync()
+
+    def sync(self):
+        self._load_event.set()
 
     def set_item(self, key, value):
         with self._direct_state:
@@ -450,7 +453,7 @@ class interface(Dotkeys):
 
     @update
     def add_port(self, direct, port):
-        if isinstance(port, interface):
+        if isinstance(port, Interface):
             port = port['index']
         if not direct:
             transaction = self.last()
@@ -460,7 +463,7 @@ class interface(Dotkeys):
 
     @update
     def del_port(self, direct, port):
-        if isinstance(port, interface):
+        if isinstance(port, Interface):
             port = port['index']
         if not direct:
             transaction = self.last()
@@ -489,7 +492,8 @@ class interface(Dotkeys):
         Return last open transaction
         '''
         if not self._tids:
-            raise IPDBTransactionRequired()
+            raise TypeError('start a transaction first')
+
         return self._transactions[self._tids[-1]]
 
     def review(self):
@@ -497,7 +501,8 @@ class interface(Dotkeys):
         Review last open transaction
         '''
         if not self._tids:
-            raise IPDBTransactionRequired()
+            raise TypeError('start a transaction first')
+
         added = self.last() - self
         removed = self - self.last()
         added['-ipaddr'] = removed['ipaddr']
@@ -521,8 +526,8 @@ class interface(Dotkeys):
         self._load_event.clear()
         try:
             self.ip.get_links(self['index'])
-        except Empty as e:
-            raise IPDBUnrecoverableError('lost netlink', e)
+        except Empty:
+            raise IOError('lost netlink connection')
         self._load_event.wait()
 
     def commit(self, tid=None, transaction=None, rollback=False):
@@ -575,41 +580,42 @@ class interface(Dotkeys):
 
             # 8<---------------------------------------------
             # IP address changes
-            with self['ipaddr'].target:
-                self['ipaddr'].set_target(transaction['ipaddr'])
+            self['ipaddr'].set_target(transaction['ipaddr'])
 
-                for i in removed['ipaddr']:
-                    # When you remove a primary IP addr, all subnetwork
-                    # can be removed. In this case you will fail, but
-                    # it is OK, no need to roll back
-                    try:
-                        self.ip.addr('delete', self['index'], i[0], i[1])
-                    except NetlinkError as x:
-                        # bypass only errno 99, 'Cannot assign address'
-                        if x.code != 99:
-                            raise x
+            for i in removed['ipaddr']:
+                # When you remove a primary IP addr, all subnetwork
+                # can be removed. In this case you will fail, but
+                # it is OK, no need to roll back
+                try:
+                    self.ip.addr('delete', self['index'], i[0], i[1])
+                except NetlinkError as x:
+                    # bypass only errno 99, 'Cannot assign address'
+                    if x.code != 99:
+                        raise x
 
-                for i in added['ipaddr']:
-                    self.ip.addr('add', self['index'], i[0], i[1])
+            for i in added['ipaddr']:
+                self.ip.addr('add', self['index'], i[0], i[1])
 
-                if removed['ipaddr'] or added['ipaddr']:
-                    self['ipaddr'].target.wait(3)
+            if removed['ipaddr'] or added['ipaddr']:
+                self['ipaddr'].target.wait(_SYNC_TIMEOUT)
+                assert self['ipaddr'].target.is_set()
 
             # 8<---------------------------------------------
             # Interface slaves
-            with self['ports'].target:
-                self['ports'].set_target(transaction['ports'])
+            self['ports'].set_target(transaction['ports'])
 
-                for i in removed['ports']:
-                    # detach the port
-                    self.ip.link('set', index=i, master=0)
+            for i in removed['ports']:
+                # detach the port
+                self.ip.link('set', index=i, master=0)
 
-                for i in added['ports']:
-                    # enslave the port
-                    self.ip.link('set', index=i, master=self['index'])
+            for i in added['ports']:
+                # enslave the port
+                self.ip.link('set', index=i, master=self['index'])
 
-                if removed['ports'] or added['ports']:
-                    self['ports'].target.wait(3)
+            if removed['ports'] or added['ports']:
+                self.ip.get_links(*(removed['ports'] | added['ports']))
+                self['ports'].target.wait(_SYNC_TIMEOUT)
+                assert self['ports'].target.is_set()
 
             # 8<---------------------------------------------
             # Interface changes
@@ -621,7 +627,23 @@ class interface(Dotkeys):
             # apply changes only if there is something to apply
             if request:
                 self.ip.link('set', index=self['index'], **request)
+
             # 8<---------------------------------------------
+            # Interface removal
+            if added.get('removal'):
+                self._load_event.clear()
+                self.ip.link('delete', index=self['index'])
+                self._load_event.wait(_SYNC_TIMEOUT)
+                assert self._load_event.is_set()
+                self.drop()
+                self._mode = 'invalid'
+                return
+            # 8<---------------------------------------------
+
+            if rollback:
+                assert _FAIL_ROLLBACK & _FAIL_MASK
+            else:
+                assert _FAIL_COMMIT & _FAIL_MASK
 
         except Exception as e:
             # something went wrong: roll the transaction back
@@ -658,7 +680,19 @@ class interface(Dotkeys):
                 self.drop()
                 self['ipaddr'].set_target(None)
                 self['ports'].set_target(None)
-                raise e
+                # reload all the database -- it can take a long time,
+                # but it is required since we have no idea, what is
+                # the result of the failure
+                #
+                # ACHTUNG: database reload is asynchronous, so after
+                # getting RuntimeError() from commit(), take a seat
+                # and rest for a while. It is an extremal case, it
+                # should not became at all, and there is no sync.
+                self.ip.get_links()
+                self.ip.get_addr()
+                x = RuntimeError()
+                x.cause = e
+                raise x
 
         # if it is not a rollback turn
         if not rollback:
@@ -687,6 +721,9 @@ class interface(Dotkeys):
         Requires commit.
         '''
         self['flags'] &= ~(self['flags'] & 1)
+
+    def remove(self):
+        self['removal'] = True
 
 
 class IPDB(Dotkeys):
@@ -734,7 +771,6 @@ class IPDB(Dotkeys):
         self.update_addr(self.ip.get_addr())
 
         # start monitoring thread
-        self.ip.monitor()
         self.ip.mirror()
         self._mthread = threading.Thread(target=self.monitor)
         self._mthread.setDaemon(True)
@@ -751,13 +787,6 @@ class IPDB(Dotkeys):
         ret.append('by_name')
         ret.append('by_index')
         return ret
-
-    def shutdown(self):
-        '''
-        Deprecated: use ipdb.release() instead.
-        '''
-        logging.warn('IPDB: using deprecated call "shutdown()"')
-        self.release()
 
     def release(self):
         '''
@@ -786,7 +815,7 @@ class IPDB(Dotkeys):
 
         FIXME: this should be documented.
         '''
-        i = interface(ipr=self.ip, parent=self, mode='snapshot')
+        i = Interface(ipr=self.ip, parent=self, mode='snapshot')
         i['kind'] = kind
         i['index'] = kwarg.get('index', 0)
         i['ifname'] = ifname
@@ -799,8 +828,6 @@ class IPDB(Dotkeys):
     def detach(self, item):
         if item in self:
             del self[item]
-            if item in self.ipaddr:
-                del self.ipaddr[item]
 
     def update_links(self, links):
         '''
@@ -813,7 +840,7 @@ class IPDB(Dotkeys):
                 self.by_index[dev['index']] = \
                 self[dev['index']] = \
                 self.get(dev.get_attr('IFLA_IFNAME')[0], None) or \
-                interface(ipr=self.ip, parent=self, mode=self.mode)
+                Interface(ipr=self.ip, parent=self, mode=self.mode)
             i.load(dev)
             self[i['ifname']] = \
                 self.by_name[i['ifname']] = i
@@ -822,9 +849,7 @@ class IPDB(Dotkeys):
     def _lookup_master(self, msg):
         index = msg['index']
         master = msg.get_attr('IFLA_MASTER') or msg.get_attr('IFLA_LINK')
-        if master:
-            master = master[0]
-        elif _ANCIENT_PLATFORM:
+        if _ANCIENT_PLATFORM:
             # FIXME: do something with it, please
             # if the master is not reported by netlink, lookup it
             # through /sys:
@@ -836,6 +861,8 @@ class IPDB(Dotkeys):
             master = int(f.read())
             f.close()
             self[index].set_item('master', master)
+        elif master:
+            master = master[0]
         else:
             master = None
 
@@ -874,7 +901,8 @@ class IPDB(Dotkeys):
                         device.del_item('master')
                     if 'link' in device:
                         device.del_item('link')
-                    if master in self:
+                    if (master in self) and \
+                            (msg['index'] in self[master].ports):
                         self[master].del_port(msg['index'], direct=True)
 
     def update_addr(self, addrs, action='add'):
@@ -929,6 +957,7 @@ class IPDB(Dotkeys):
                     self.update_slaves([msg])
                     if msg['change'] == 0xffffffff:
                         # FIXME catch exception
+                        self[msg['index']].sync()
                         del self.by_name[self[msg['index']]['ifname']]
                         del self.by_index[msg['index']]
                         del self.old_names[msg['index']]

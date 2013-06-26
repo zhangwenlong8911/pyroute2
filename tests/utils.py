@@ -1,11 +1,19 @@
 import os
 import re
 import pwd
+import platform
 import subprocess
 from nose.plugins.skip import SkipTest
 
 
+def conflict_arch(arch):
+    if platform.machine().find(arch) >= 0:
+        raise SkipTest('conflict with architecture %s' % (arch))
+
+
 def require_user(user):
+    if bool(os.environ.get('PYROUTE2_TESTS_RO', False)):
+        raise SkipTest('read-only tests requested')
     if pwd.getpwuid(os.getuid()).pw_name != user:
         raise SkipTest('required user %s' % (user))
 

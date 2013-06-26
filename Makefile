@@ -17,7 +17,7 @@
 # 	Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 version ?= "0.1"
-release ?= "0.1.9"
+release ?= "0.1.10"
 python ?= "python"
 
 ifdef root
@@ -32,6 +32,10 @@ ifdef coverage
 	override coverage := "--cover-html"
 endif
 
+ifdef pdb
+	override pdb := --pdb --pdb-failures
+endif
+
 
 all:
 	@echo targets: dist, install
@@ -39,6 +43,7 @@ all:
 clean: clean-version
 	rm -rf dist build MANIFEST
 	rm -f docs/general.rst
+	rm -f docs/changelog.rst
 	rm -f  tests/.coverage
 	rm -rf tests/htmlcov
 	rm -rf tests/cover
@@ -64,12 +69,13 @@ update-version: setup.py docs/conf.py
 
 docs: clean force-version
 	cp README.md docs/general.rst
+	cp CHANGELOG.md docs/changelog.rst
 	make -C docs html
 
 test:
 	@flake8 .
 	@export PYTHONPATH=`pwd`; cd tests; \
-		nosetests -v --pdb --pdb-failures \
+		nosetests -v ${pdb} \
 			--with-coverage \
 			--cover-package=pyroute2 \
 			${coverage} \
