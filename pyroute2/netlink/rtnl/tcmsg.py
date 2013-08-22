@@ -74,7 +74,7 @@ def _time2tick(t):
 
 def _calc_xmittime(rate, size):
     # The current code is ported from tc utility
-    return _time2tick(TIME_UNITS_PER_SEC * (float(size) / rate))
+    return round(_time2tick(TIME_UNITS_PER_SEC * (float(size) / rate)))
 
 
 def _red_eval_ewma(qmin, burst, avpkt):
@@ -107,12 +107,7 @@ def _red_eval_P(qmin, qmax, probability):
     return i
 
 
-def get_u32_parameters(kwarg):
-    return {'attrs': [['TCA_U32_CLASSID', kwarg['target']],
-                      ['TCA_U32_SEL', {'keys': kwarg['keys']}]]}
-
-
-def get_tbf_parameters(kwarg):
+def _get_rate_parameters(kwarg):
     # rate and burst are required
     rate = _get_rate(kwarg['rate'])
     burst = kwarg['burst']
@@ -126,7 +121,7 @@ def get_tbf_parameters(kwarg):
     # limit OR latency is required
     limit = kwarg.get('limit', None)
     latency = _get_time(kwarg.get('latency', None))
-    assert limit or latency
+    assert limit is not None or latency is not None
 
     # calculate limit from latency
     if limit is None:
@@ -139,12 +134,41 @@ def get_tbf_parameters(kwarg):
                 rate_limit = peak_limit
         limit = rate_limit
 
+    return {'rate': rate,
+            'mtu': mtu,
+            'buffer': _calc_xmittime(rate, burst),
+            'limit': limit}
+
+
+def get_tbf_parameters(kwarg):
+    parms = _get_rate_parameters(kwarg)
     # fill parameters
-    return {'attrs': [['TCA_TBF_PARMS', {'rate': rate,
-                                         'mtu': mtu,
-                                         'buffer': _calc_xmittime(rate, burst),
-                                         'limit': limit}],
+    return {'attrs': [['TCA_TBF_PARMS', parms],
                       ['TCA_TBF_RTAB', True]]}
+
+
+def get_u32_parameters(kwarg):
+    ret = {'attrs': []}
+
+    if kwarg.get('rate'):
+        # if no limit specified, set it to zero to make
+        # the next call happy
+        kwarg['limit'] = kwarg.get('limit', 0)
+        tbfp = _get_rate_parameters(kwarg)
+        # create an alias -- while TBF uses 'buffer', rate
+        # policy uses 'burst'
+        tbfp['burst'] = tbfp['buffer']
+        # action resolver
+        actions = nla_plus_police.police.police_tbf.actions
+        tbfp['action'] = actions[kwarg['action']]
+        police = [['TCA_POLICE_TBF', tbfp],
+                  ['TCA_POLICE_RATE', True]]
+        ret['attrs'].append(['TCA_U32_POLICE', {'attrs': police}])
+
+    ret['attrs'].append(['TCA_U32_CLASSID', kwarg['target']])
+    ret['attrs'].append(['TCA_U32_SEL', {'keys': kwarg['keys']}])
+
+    return ret
 
 
 def get_sfq_parameters(kwarg):
@@ -293,21 +317,23 @@ class nla_plus_rtab(nla):
 
         def encode(self):
             parms = self.parent.get_attr('TCA_TBF_PARMS') or \
-                self.parent.get_attr('TCA_HTB_PARMS')
-            if parms:
-                self.value = getattr(parms[0], self.__class__.__name__)
+                self.parent.get_attr('TCA_HTB_PARMS') or \
+                self.parent.get_attr('TCA_POLICE_TBF')
+            if parms is not None:
+                self.value = getattr(parms, self.__class__.__name__)
                 self['value'] = struct.pack('I' * 256, *self.value)
             nla.encode(self)
 
         def decode(self):
             nla.decode(self)
             parms = self.parent.get_attr('TCA_TBF_PARMS') or \
-                self.parent.get_attr('TCA_HTB_PARMS')
-            if parms:
+                self.parent.get_attr('TCA_HTB_PARMS') or \
+                self.parent.get_attr('TCA_POLICE_TBF')
+            if parms is not None:
                 rtab = struct.unpack('I' * (len(self['value']) / 4),
                                      self['value'])
                 self.value = rtab
-                setattr(parms[0], self.__class__.__name__, rtab)
+                setattr(parms, self.__class__.__name__, rtab)
 
     class ptab(rtab):
         pass
@@ -317,15 +343,15 @@ class nla_plus_rtab(nla):
 
 
 class nla_plus_police(nla):
-    class police(nla):
+    class police(nla_plus_rtab):
         nla_map = (('TCA_POLICE_UNSPEC', 'none'),
                    ('TCA_POLICE_TBF', 'police_tbf'),
-                   ('TCA_POLICE_RATE', 'hex'),
-                   ('TCA_POLICE_PEAKRATE', 'hex'),
-                   ('TCA_POLICE_AVRATE', 'hex'),
-                   ('TCA_POLICE_RESULT', 'hex'))
+                   ('TCA_POLICE_RATE', 'rtab'),
+                   ('TCA_POLICE_PEAKRATE', 'ptab'),
+                   ('TCA_POLICE_AVRATE', 'uint32'),
+                   ('TCA_POLICE_RESULT', 'uint32'))
 
-        class police_tbf(nla):
+        class police_tbf(nla_plus_rtab.parms):
             fields = (('index', 'I'),
                       ('action', 'i'),
                       ('limit', 'I'),
@@ -347,8 +373,18 @@ class nla_plus_police(nla):
                       ('bindcnt', 'i'),
                       ('capab', 'I'))
 
+            actions = {'unspec': -1,     # TC_POLICE_UNSPEC
+                       'ok': 0,          # TC_POLICE_OK
+                       'reclassify': 1,  # TC_POLICE_RECLASSIFY
+                       'shot': 2,        # TC_POLICE_SHOT
+                       'drop': 2,        # TC_POLICE_SHOT
+                       'pipe': 3}        # TC_POLICE_PIPE
+
 
 class tcmsg(nlmsg):
+
+    prefix = 'TCA_'
+
     fields = (('family', 'B'),
               ('pad1', 'B'),
               ('pad2', 'H'),
@@ -401,9 +437,8 @@ class tcmsg(nlmsg):
 
     def get_xstats(self, *argv, **kwarg):
         kind = self.get_attr('TCA_KIND')
-        if kind:
-            if kind[0] == 'htb':
-                return self.xstats_htb
+        if kind == 'htb':
+            return self.xstats_htb
         return self.hex
 
     class xstats_htb(nla):
@@ -415,25 +450,23 @@ class tcmsg(nlmsg):
 
     def get_options(self, *argv, **kwarg):
         kind = self.get_attr('TCA_KIND')
-        if kind:
-            if kind[0] == 'ingress':
-                return self.options_ingress
-            elif kind[0] == 'pfifo_fast':
-                return self.options_pfifo_fast
-            elif kind[0] == 'tbf':
-                return self.options_tbf
-            elif kind[0] == 'sfq':
-                if kwarg.get('length', 0) >= \
-                        struct.calcsize(self.options_sfq_v1.fmt):
-                    return self.options_sfq_v1
-                else:
-                    return self.options_sfq_v0
-            elif kind[0] == 'htb':
-                return self.options_htb
-            elif kind[0] == 'u32':
-                return self.options_u32
-            elif kind[0] == 'fw':
-                return self.options_fw
+        if kind == 'ingress':
+            return self.options_ingress
+        elif kind == 'pfifo_fast':
+            return self.options_pfifo_fast
+        elif kind == 'tbf':
+            return self.options_tbf
+        elif kind == 'sfq':
+            if kwarg.get('length', 0) >= self.options_sfq_v1.get_size():
+                return self.options_sfq_v1
+            else:
+                return self.options_sfq_v0
+        elif kind == 'htb':
+            return self.options_htb
+        elif kind == 'u32':
+            return self.options_u32
+        elif kind == 'fw':
+            return self.options_fw
         return self.hex
 
     class options_ingress(nla):
@@ -539,6 +572,7 @@ class tcmsg(nlmsg):
                 # 'header' array to pack keys to
                 header = [(0, 0) for i in range(256)]
 
+                keys = []
                 # iterate keys and pack them to the 'header'
                 for key in self['keys']:
                     # TODO tags: filter
@@ -561,6 +595,12 @@ class tcmsg(nlmsg):
                     mask = int(mask, 0)
                     value = int(key, 0)
                     bits = 24
+                    if mask == 0 and value == 0:
+                        key = self.u32_key(self.buf)
+                        key['key_off'] = offset
+                        key['key_mask'] = mask
+                        key['key_val'] = value
+                        keys.append(key)
                     for bmask in struct.unpack('4B', struct.pack('>I', mask)):
                         if bmask > 0:
                             bvalue = (value & (bmask << bits)) >> bits
@@ -569,7 +609,6 @@ class tcmsg(nlmsg):
                         bits -= 8
 
                 # recalculate keys from 'header'
-                keys = []
                 key = None
                 value = 0
                 mask = 0

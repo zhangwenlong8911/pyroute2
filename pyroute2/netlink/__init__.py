@@ -324,11 +324,15 @@ class NetlinkSocket(socket.socket):
         socket.socket.__init__(self, socket.AF_NETLINK,
                                socket.SOCK_DGRAM, family)
         self.pid = os.getpid()
-        self.groups = None
+        self.groups = 0
+        self.marshal = None
 
     def bind(self, groups=0):
         self.groups = groups
         socket.socket.bind(self, (self.pid, self.groups))
+
+    def get(self):
+        return self.marshal.parse(self.recv(16384))
 
 
 class ssl_credentials(object):
@@ -564,7 +568,7 @@ class IOThread(threading.Thread):
             cmd = self.parse_control(data)
             if cmd['cmd'] == IPRCMD_ROUTE:
                 # routing request
-                family = cmd.get_attr('CTRL_ATTR_FAMILY_ID')[0]
+                family = cmd.get_attr('CTRL_ATTR_FAMILY_ID')
                 if family in self.families:
                     send = self.families[family]
                     self.rtable[sock] = send
@@ -576,7 +580,7 @@ class IOThread(threading.Thread):
                 # * ...
             elif cmd['cmd'] == IPRCMD_REGISTER:
                 # auth request
-                secret = cmd.get_attr('IPR_ATTR_SECRET')[0]
+                secret = cmd.get_attr('IPR_ATTR_SECRET')
                 if secret == self.secret:
                     self.controls.add(sock)
                     rsp['cmd'] = IPRCMD_ACK

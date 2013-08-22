@@ -165,6 +165,13 @@ class nlmsg_base(dict):
         return self.getvalue() == value
 
     @classmethod
+    def get_size(self):
+        size = 0
+        for field in self.fields:
+            size += struct.calcsize(field[1])
+        return size
+
+    @classmethod
     def nla2name(self, name):
         '''
         Convert NLA name into human-friendly name
@@ -311,7 +318,7 @@ class nlmsg_base(dict):
         if self.header is not None:
             self.update_length(init, diff)
 
-    def update_length(self, start, diff):
+    def update_length(self, start, diff=0):
         save = self.buf.tell()
         self['header']['length'] = save - start - diff
         self.buf.seek(start)
@@ -327,7 +334,17 @@ class nlmsg_base(dict):
 
     def get_attr(self, attr):
         '''
-        Return attr by name
+        Return first attr by name or None
+        '''
+        attrs = self.get_attrs(attr)
+        if attrs:
+            return attrs[0]
+        else:
+            return None
+
+    def get_attrs(self, attr):
+        '''
+        Return attrs by name
         '''
         return [i[1] for i in self['attrs'] if i[0] == attr]
 
