@@ -1,6 +1,33 @@
 changelog
 =========
 
+* 0.2.7
+    * ipdb: use separate namespaces for utility functions and other stuff
+    * ipdb: generic callbacks (see also IPDB.wait_interface())
+    * iocore: initial multipath support 
+    * iocore: use of 16byte uuid4 for packet ids
+* 0.2.6
+    * rpc: initial version, REQ/REP, PUSH/PULL
+    * iocore: shared IOLoop
+    * iocore: AddrPool usage
+    * iproute: policing in FW filter
+    * python3 compatibility issues fixed
+* 0.2.4
+    * python3 compatibility issues fixed, tests passed
+* 0.2.3
+    * [fix]: #28 -- bundle issue
+* 0.2.2
+    * iocore: new component
+    * iocore: separate IOCore and IOBroker
+    * iocore: change from peer-to-peer to flat addresses
+    * iocore: REP/REQ, PUSH/PULL
+    * iocore: support for UDP PUSH/PULL
+    * iocore: AddrPool component for addresses and nonces
+    * generic: allow multiple re-encoding
+* 0.1.12
+    * ipdb: transaction commit callbacks
+    * iproute: delete root qdisc (@chantra)
+    * iproute: netem qdisc management (@chantra)
 * 0.1.11
     * netlink: get qdiscs for particular interface
     * netlink: IPRSocket threadless objects

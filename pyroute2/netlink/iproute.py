@@ -1,27 +1,65 @@
+'''
+iproute module
+==============
+
+`iproute` module provides low-level API to RTNetlink protocol
+via `IPRoute` and `IPRSocket` classes as well as all required
+constants.
+
+threaded vs. threadless architecture
+------------------------------------
+
+Please note, that objects of `IPRoute` class implicitly start
+three threads:
+
+* Netlink I/O thread -- main thread that performs all Netlink I/O
+* Reasm and parsing thread -- thread that reassembles messages and
+  parses them into dict-like structures
+* Masquerade cache thread -- `IPRoute` objects can be connected
+  together, and in this case header masquerading should be performed
+  on netlink packets; the thread performs masquerade cache expiration
+
+In most cases it should be ok, `IPRoute` uses no daemonic threads and
+explicit `release()` call is provided to stop all the threads. Beside
+of that, the architecture provides packet buffering.
+
+But if you do not like implicit threads, you can use simplest
+threadless RTNetlink interface, `IPRSocket`.
+
+classes
+-------
+'''
 
 from socket import htons
 from socket import AF_INET
 from socket import AF_INET6
 from socket import AF_UNSPEC
-from pyroute2.netlink import Netlink
 from pyroute2.netlink import Marshal
 from pyroute2.netlink import NetlinkSocket
+from pyroute2.netlink import NLMSG_ERROR
+from pyroute2.netlink import NLM_F_ATOMIC
+from pyroute2.netlink import NLM_F_ROOT
 from pyroute2.netlink import NLM_F_REQUEST
 from pyroute2.netlink import NLM_F_ACK
 from pyroute2.netlink import NLM_F_DUMP
 from pyroute2.netlink import NLM_F_CREATE
 from pyroute2.netlink import NLM_F_EXCL
+from pyroute2.netlink.client import Netlink
 from pyroute2.netlink.generic import NETLINK_ROUTE
 from pyroute2.netlink.rtnl.tcmsg import tcmsg
 from pyroute2.netlink.rtnl.tcmsg import get_htb_parameters
+from pyroute2.netlink.rtnl.tcmsg import get_htb_class_parameters
 from pyroute2.netlink.rtnl.tcmsg import get_tbf_parameters
 from pyroute2.netlink.rtnl.tcmsg import get_sfq_parameters
 from pyroute2.netlink.rtnl.tcmsg import get_u32_parameters
+from pyroute2.netlink.rtnl.tcmsg import get_netem_parameters
+from pyroute2.netlink.rtnl.tcmsg import get_fw_parameters
 from pyroute2.netlink.rtnl.rtmsg import rtmsg
 from pyroute2.netlink.rtnl.ndmsg import ndmsg
 from pyroute2.netlink.rtnl.ifinfmsg import ifinfmsg
 from pyroute2.netlink.rtnl.ifaddrmsg import ifaddrmsg
 
+from pyroute2.common import basestring
 from pyroute2.common import map_namespace
 
 
@@ -137,6 +175,13 @@ rtscopes = {'RT_SCOPE_UNIVERSE': 0,
             'RT_SCOPE_NOWHERE': 255}
 
 
+def transform_handle(handle):
+    if isinstance(handle, basestring):
+        (major, minor) = [int(x if x else '0', 16) for x in handle.split(':')]
+        handle = (major << 8 * 2) | minor
+    return handle
+
+
 class MarshalRtnl(Marshal):
     msg_map = {RTM_NEWLINK: ifinfmsg,
                RTM_DELLINK: ifinfmsg,
@@ -144,6 +189,8 @@ class MarshalRtnl(Marshal):
                RTM_DELADDR: ifaddrmsg,
                RTM_NEWROUTE: rtmsg,
                RTM_DELROUTE: rtmsg,
+               RTM_NEWRULE: rtmsg,
+               RTM_DELRULE: rtmsg,
                RTM_NEWNEIGH: ndmsg,
                RTM_DELNEIGH: ndmsg,
                RTM_NEWQDISC: tcmsg,
@@ -154,6 +201,7 @@ class MarshalRtnl(Marshal):
                RTM_DELTFILTER: tcmsg}
 
     def fix_message(self, msg):
+        # FIXME: pls do something with it
         try:
             msg['event'] = RTM_VALUES[msg['header']['type']]
         except:
@@ -161,6 +209,12 @@ class MarshalRtnl(Marshal):
 
 
 class IPRSocket(NetlinkSocket):
+    '''
+    Simple threadless RTNetlink socket. Quite useful, if you want only
+    watch RTNetlink events. Please note, that using this objects you
+    are responsible to handle packets asap -- netlink protocol just
+    drops messages when they're processed too slowly.
+    '''
 
     def __init__(self):
         NetlinkSocket.__init__(self, NETLINK_ROUTE)
@@ -171,6 +225,10 @@ class IPRSocket(NetlinkSocket):
 
 
 class IPRoute(Netlink):
+    '''
+    You can think of this class in some way as of plain old iproute2
+    utility.
+    '''
     marshal = MarshalRtnl
     family = NETLINK_ROUTE
     groups = RTNL_GROUPS
@@ -181,7 +239,8 @@ class IPRoute(Netlink):
     #
     def get_qdiscs(self, index=None):
         '''
-        Get all queue disciplines
+        Get all queue disciplines for all interfaces or for specified
+        one.
         '''
         msg = tcmsg()
         msg['family'] = AF_UNSPEC
@@ -193,7 +252,7 @@ class IPRoute(Netlink):
 
     def get_filters(self, index=0, handle=0, parent=0):
         '''
-        Get filters
+        Get filters for specified interface, handle and parent.
         '''
         msg = tcmsg()
         msg['family'] = AF_UNSPEC
@@ -204,7 +263,7 @@ class IPRoute(Netlink):
 
     def get_classes(self, index=0):
         '''
-        Get classes
+        Get classes for specified interface.
         '''
         msg = tcmsg()
         msg['family'] = AF_UNSPEC
@@ -217,14 +276,14 @@ class IPRoute(Netlink):
 
         By default returns all interfaces. Arguments vector
         can contain interface indices or a special keyword
-        'all':
+        'all'::
 
-        ip.get_links()
-        ip.get_links('all')
-        ip.get_links(1, 2, 3)
+            ip.get_links()
+            ip.get_links('all')
+            ip.get_links(1, 2, 3)
 
-        interfaces = [1, 2, 3]
-        ip.get_links(*interfaces)
+            interfaces = [1, 2, 3]
+            ip.get_links(*interfaces)
         '''
         result = []
         links = argv or ['all']
@@ -254,6 +313,20 @@ class IPRoute(Netlink):
         msg['family'] = family
         return self.nlm_request(msg, RTM_GETADDR)
 
+    def get_rules(self, family=AF_UNSPEC):
+        '''
+        Get all rules.
+        You can specify inet family, by default return rules for all families.
+
+        Example::
+            ip.get_rules() # get all the rules for all families
+            ip.get_routes(family=AF_INET6)  # get only IPv6 rules
+        '''
+        msg = ndmsg()
+        msg['family'] = family
+        msg_flags = NLM_F_REQUEST | NLM_F_ROOT | NLM_F_ATOMIC
+        return self.nlm_request(msg, RTM_GETRULE, msg_flags)
+
     def get_routes(self, family=AF_UNSPEC, **kwarg):
         '''
         Get all routes. You can specify the table. There
@@ -261,11 +334,11 @@ class IPRoute(Netlink):
         returns all the routes on each request. So the
         routine filters routes from full output.
 
-        Example:
+        Example::
 
-        ip.get_routes()  # get all the routes for all families
-        ip.get_routes(family=AF_INET6)  # get only IPv6 routes
-        ip.get_routes(table=254)  # get routes from 254 table
+            ip.get_routes()  # get all the routes for all families
+            ip.get_routes(family=AF_INET6)  # get only IPv6 routes
+            ip.get_routes(table=254)  # get routes from 254 table
         '''
 
         kwarg['table'] = kwarg.get('table', None)
@@ -295,19 +368,21 @@ class IPRoute(Netlink):
     #
     def link_up(self, index):
         '''
-        Switch an interface up
+        Switch an interface up unconditionally.
         '''
         self.link('set', index=index, state='up')
 
     def link_down(self, index):
         '''
-        Switch an interface down
+        Switch an interface down unconditilnally.
         '''
         self.link('set', index=index, state='down')
 
     def link_rename(self, index, name):
         '''
-        Rename an interface
+        Rename an interface. Please note, that the interface must be
+        in the `DOWN` state in order to be renamed, otherwise you
+        will get an error.
         '''
         self.link('set', index=index, ifname=name)
 
@@ -322,16 +397,16 @@ class IPRoute(Netlink):
         Lookup interface index (indeces) by first level NLA
         value.
 
-        Example:
+        Example::
 
-        ip.link_lookup(address="52:54:00:9d:4e:3d")
-        ip.link_lookup(ifname="lo")
-        ip.link_lookup(operstate="UP")
+            ip.link_lookup(address="52:54:00:9d:4e:3d")
+            ip.link_lookup(ifname="lo")
+            ip.link_lookup(operstate="UP")
 
         Please note, that link_lookup() returns list, not one
         value.
         '''
-        name = kwarg.keys()[0]
+        name = tuple(kwarg.keys())[0]
         value = kwarg[name]
 
         name = str(name).upper()
@@ -353,35 +428,35 @@ class IPRoute(Netlink):
 
         * command -- set, add or delete
         * index -- device index
-        * **kwarg -- keywords, NLA
+        * \*\*kwarg -- keywords, NLA
 
-        Example:
+        Example::
 
-        x = 62  # interface index
-        ip.link("set", index=x, state="down")
-        ip.link("set", index=x, address="00:11:22:33:44:55", name="bala")
-        ip.link("set", index=x, mtu=1000, txqlen=2000)
-        ip.link("set", index=x, state="up")
+            x = 62  # interface index
+            ip.link("set", index=x, state="down")
+            ip.link("set", index=x, address="00:11:22:33:44:55", name="bala")
+            ip.link("set", index=x, mtu=1000, txqlen=2000)
+            ip.link("set", index=x, state="up")
 
         Keywords "state", "flags" and "mask" are reserved. State can
-        be "up" or "down", it is a shortcut:
+        be "up" or "down", it is a shortcut::
 
-        state="up":   flags=1, mask=1
-        state="down": flags=0, mask=0
+            state="up":   flags=1, mask=1
+            state="down": flags=0, mask=0
 
-        For more flags grep IFF_ in the kernel code, until we write
+        For more flags grep IFF in the kernel code, until we write
         human-readable flag resolver.
 
         Other keywords are from ifinfmsg.nla_map, look into the
         corresponding module. You can use the form "ifname" as well
-        as "IFLA_IFNAME" and so on, so that's equal:
+        as "IFLA_IFNAME" and so on, so that's equal::
 
-        ip.link("set", index=x, mtu=1000)
-        ip.link("set", index=x, IFLA_MTU=1000)
+            ip.link("set", index=x, mtu=1000)
+            ip.link("set", index=x, IFLA_MTU=1000)
 
-        You can also delete interface with:
+        You can also delete interface with::
 
-        ip.link("delete", index=x)
+            ip.link("delete", index=x)
         '''
 
         commands = {'set': RTM_SETLINK,      # almost all operations
@@ -394,8 +469,8 @@ class IPRoute(Netlink):
         # index is required
         msg['index'] = kwarg.get('index')
 
-        flags = kwarg.pop('flags', 0)
-        mask = kwarg.pop('mask', 0) or kwarg.pop('change', 0)
+        flags = kwarg.pop('flags', 0) or 0
+        mask = kwarg.pop('mask', 0) or kwarg.pop('change', 0) or 0
 
         if 'state' in kwarg:
             mask = 1                  # IFF_UP mask
@@ -413,7 +488,7 @@ class IPRoute(Netlink):
 
         return self.nlm_request(msg, msg_type=command, msg_flags=msg_flags)
 
-    def addr(self, command, index, address, mask=24, family=AF_INET):
+    def addr(self, command, index, address, mask=24, family=None, scope=0):
         '''
         Address operations
 
@@ -422,12 +497,13 @@ class IPRoute(Netlink):
         * address -- IPv4 or IPv6 address
         * mask -- address mask
         * family -- socket.AF_INET for IPv4 or socket.AF_INET6 for IPv6
+        * scope -- the address scope, see /etc/iproute2/rt_scopes
 
-        Example:
+        Example::
 
-        index = 62
-        ip.addr("add", index, address="10.0.0.1", mask=24)
-        ip.addr("add", index, address="10.0.0.2", mask=24)
+            index = 62
+            ip.addr("add", index, address="10.0.0.1", mask=24)
+            ip.addr("add", index, address="10.0.0.2", mask=24)
         '''
 
         commands = {'add': RTM_NEWADDR,
@@ -435,54 +511,179 @@ class IPRoute(Netlink):
         command = commands.get(command, command)
 
         flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL
+
+        # try to guess family, if it is not forced
+        if family is None and address.find(":") > -1:
+            family = AF_INET6
+        else:
+            family = AF_INET
+
         msg = ifaddrmsg()
         msg['index'] = index
         msg['family'] = family
         msg['prefixlen'] = mask
-        msg['scope'] = 0xfe
+        msg['scope'] = scope
         if family == AF_INET:
             msg['attrs'] = [['IFA_LOCAL', address],
                             ['IFA_ADDRESS', address]]
         elif family == AF_INET6:
             msg['attrs'] = [['IFA_ADDRESS', address]]
-        return self.nlm_request(msg, msg_type=command, msg_flags=flags)
+        terminate = lambda x: x['header']['type'] == NLMSG_ERROR
+        return self.nlm_request(msg,
+                                msg_type=command,
+                                msg_flags=flags,
+                                terminate=terminate)
 
-    def tc(self, command, kind, index, handle, **kwarg):
+    def tc(self, command, kind, index, handle=0, **kwarg):
         '''
-        '''
-        # FIXME: there should be some documentation
-        # TODO tags: tc[0.1.7]
+        "Swiss knife" for traffic control. With the method you can
+        add, delete or modify qdiscs, classes and filters.
 
+        * command -- add or delete qdisc, class, filter.
+        * kind -- a string identifier -- "sfq", "htb", "u32" and so on.
+        * handle -- integer or string
+
+        Command can be one of ("add", "del", "add-class", "del-class",
+        "add-filter", "del-filter") (see `commands` dict in the code).
+
+        Handle notice: traditional iproute2 notation, like "1:0", actually
+        represents two parts in one four-bytes integer::
+
+            1:0    ->    0x10000
+            1:1    ->    0x10001
+            ff:0   ->   0xff0000
+            ffff:1 -> 0xffff0001
+
+        For pyroute2 tc() you can use both forms: integer like 0xffff0000
+        or string like 'ffff:0000'. By default, handle is 0, so you can add
+        simple classless queues w/o need to specify handle. Ingress queue
+        causes handle to be 0xffff0000.
+
+        So, to set up sfq queue on interface 1, the function call
+        will be like that::
+
+            ip = IPRoute()
+            ip.tc("add", "sfq", 1)
+
+        Instead of string commands ("add", "del"...), you can use also
+        module constants, `RTM_NEWQDISC`, `RTM_DELQDISC` and so on::
+
+            ip = IPRoute()
+            ip.tc(RTM_NEWQDISC, "sfq", 1)
+
+        More complex example with htb qdisc, lets assume eth0 == 2::
+
+            #          u32 -->    +--> htb 1:10 --> sfq 10:0
+            #          |          |
+            #          |          |
+            # eth0 -- htb 1:0 -- htb 1:1
+            #          |          |
+            #          |          |
+            #          u32 -->    +--> htb 1:20 --> sfq 20:0
+
+            eth0 = 2
+            # add root queue 1:0
+            ip.tc("add", "htb", eth0, 0x10000, default=0x200000)
+
+            # root class 1:1
+            ip.tc("add-class", "htb", eth0, 0x10001,
+                  parent=0x10000,
+                  rate="256kbit",
+                  burst=1024 * 6)
+
+            # two branches: 1:10 and 1:20
+            ip.tc("add-class", "htb", eth0, 0x10010,
+                  parent=0x10001,
+                  rate="192kbit",
+                  burst=1024 * 6,
+                  prio=1)
+            ip.tc("add-class", "htb", eht0, 0x10020,
+                  parent=0x10001,
+                  rate="128kbit",
+                  burst=1024 * 6,
+                  prio=2)
+
+            # two leaves: 10:0 and 20:0
+            ip.tc("add", "sfq", eth0, 0x100000,
+                  parent=0x10010,
+                  perturb=10)
+            ip.tc("add", "sfq", eth0, 0x200000,
+                  parent=0x10020,
+                  perturb=10)
+
+            # two filters: one to load packets into 1:10 and the
+            # second to 1:20
+            ip.tc("add-filter", "u32", eth0,
+                  parent=0x10000,
+                  prio=10,
+                  protocol=socket.AF_INET,
+                  target=0x10010,
+                  keys=["0x0006/0x00ff+8", "0x0000/0xffc0+2"])
+            ip.tc("add-filter", "u32", eth0,
+                  parent=0x10000,
+                  prio=10,
+                  protocol=socket.AF_INET,
+                  target=0x10020,
+                  keys=["0x5/0xf+0", "0x10/0xff+33"])
+        '''
+
+        commands = {'add': RTM_NEWQDISC,
+                    'del': RTM_DELQDISC,
+                    'delete': RTM_DELQDISC,
+                    'add-class': RTM_NEWTCLASS,
+                    'del-class': RTM_DELTCLASS,
+                    'add-filter': RTM_NEWTFILTER,
+                    'del-filter': RTM_DELTFILTER}
+        command = commands.get(command, command)
         flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL
         msg = tcmsg()
+        # transform handle, parent and target, if needed:
+        handle = transform_handle(handle)
+        for item in ('parent', 'target', 'default'):
+            if item in kwarg and kwarg[item] is not None:
+                kwarg[item] = transform_handle(kwarg[item])
         msg['index'] = index
         msg['handle'] = handle
         opts = None
         if kind == 'ingress':
             msg['parent'] = TC_H_INGRESS
+            msg['handle'] = 0xffff0000
         elif kind == 'tbf':
             msg['parent'] = TC_H_ROOT
             if kwarg:
-                # kwarg is empty for delete
                 opts = get_tbf_parameters(kwarg)
         elif kind == 'htb':
             msg['parent'] = kwarg.get('parent', TC_H_ROOT)
             if kwarg:
-                # kwarg is empty for delete
-                opts = get_htb_parameters(kwarg)
+                if command in (RTM_NEWQDISC, RTM_DELQDISC):
+                    opts = get_htb_parameters(kwarg)
+                elif command in (RTM_NEWTCLASS, RTM_DELTCLASS):
+                    opts = get_htb_class_parameters(kwarg)
+        elif kind == 'netem':
+            msg['parent'] = kwarg.get('parent', TC_H_ROOT)
+            if kwarg:
+                opts = get_netem_parameters(kwarg)
         elif kind == 'sfq':
             msg['parent'] = kwarg.get('parent', TC_H_ROOT)
             if kwarg:
-                # kwarg is empty for delete
                 opts = get_sfq_parameters(kwarg)
         elif kind == 'u32':
             msg['parent'] = kwarg.get('parent')
             msg['info'] = htons(kwarg.get('protocol', 0) & 0xffff) |\
                 ((kwarg.get('prio', 0) << 16) & 0xffff0000)
             if kwarg:
-                # kwarg is empty for delete
                 opts = get_u32_parameters(kwarg)
-        msg['attrs'] = [['TCA_KIND', kind]]
+        elif kind == 'fw':
+            msg['parent'] = kwarg.get('parent')
+            msg['info'] = htons(kwarg.get('protocol', 0) & 0xffff) |\
+                ((kwarg.get('prio', 0) << 16) & 0xffff0000)
+            if kwarg:
+                opts = get_fw_parameters(kwarg)
+        else:
+            msg['parent'] = kwarg.get('parent', TC_H_ROOT)
+
+        if kind is not None:
+            msg['attrs'] = [['TCA_KIND', kind]]
         if opts is not None:
             msg['attrs'].append(['TCA_OPTIONS', opts])
         return self.nlm_request(msg, msg_type=command, msg_flags=flags)
@@ -503,14 +704,16 @@ class IPRoute(Netlink):
         * family -- socket.AF_INET (default) or socket.AF_INET6
 
         `pyroute2/netlink/rtnl/rtmsg.py` rtmsg.nla_map:
+
         * table -- routing table to use (default: 254)
         * gateway -- via address
         * prefsrc -- preferred source IP address
+
         etc.
 
-        Example:
+        Example::
 
-        ip.route("add", prefix="10.0.0.0", mask=24, gateway="192.168.0.1")
+            ip.route("add", prefix="10.0.0.0", mask=24, gateway="192.168.0.1")
         '''
 
         commands = {'add': RTM_NEWROUTE,
@@ -537,4 +740,73 @@ class IPRoute(Netlink):
 
         return self.nlm_request(msg, msg_type=command,
                                 msg_flags=flags)
+
+    def rule(self, command, table, priority=32000, rtype='RTN_UNICAST',
+             rtscope='RT_SCOPE_UNIVERSE', family=AF_INET, src=None):
+        '''
+        Rule operations
+
+        * command  - add, delete
+        * table    - 0 < table id < 253
+        * priority - 0 < rule's priority < 32766
+        * rtype    - type of rule, default 'RTN_UNICAST'
+        * rtscope  - routing scope, default RT_SCOPE_UNIVERSE
+                     (RT_SCOPE_UNIVERSE|RT_SCOPE_SITE|\
+                      RT_SCOPE_LINK|RT_SCOPE_HOST|RT_SCOPE_NOWHERE)
+        * family   - rule's family (socket.AF_INET (default) or
+                     socket.AF_INET6)
+        * src      - IP source for Source Based (Policy Based) routing's rule
+
+        Example::
+            ip.rule('add', 10, 32000)
+
+        Will create::
+            #ip ru sh
+            ...
+            32000: from all lookup 10
+            ....
+
+        Example::
+            iproute.rule('add', 11, 32001, 'RTN_UNREACHABLE')
+
+        Will create::
+            #ip ru sh
+            ...
+            32001: from all lookup 11 unreachable
+            ....
+
+        Example::
+            iproute.rule('add', 14, 32004, src='10.64.75.141')
+
+        Will create::
+            #ip ru sh
+            ...
+            32004: from 10.64.75.141 lookup 14
+            ...
+        '''
+        if table < 0 or table > 254:
+            raise 'unsupported table number'
+
+        commands = {'add': RTM_NEWRULE,
+                    'delete': RTM_DELRULE}
+        command = commands.get(command, command)
+
+        msg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL
+        msg = rtmsg()
+        msg['table'] = table
+        msg['family'] = family
+        msg['type'] = rtypes[rtype]
+        msg['scope'] = rtscopes[rtscope]
+        msg['attrs'] = [['RTA_TABLE', table]]
+        msg['attrs'].append(['RTA_PRIORITY', priority])
+        msg['dst_len'] = 0
+        msg['src_len'] = 0
+        if src is not None:
+            msg['attrs'].append(['RTA_SRC', src])
+            addr_len = {
+                AF_INET6: 128,
+                AF_INET:  32}[family]
+            msg['src_len'] = addr_len
+        return self.nlm_request(msg, msg_type=command,
+                                msg_flags=msg_flags)
     # 8<---------------------------------------------------------------

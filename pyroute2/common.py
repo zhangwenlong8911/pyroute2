@@ -2,6 +2,21 @@
 Common utilities
 '''
 import re
+import os
+import time
+import sys
+import struct
+import logging
+import threading
+import traceback
+
+try:
+    basestring = basestring
+except NameError:
+    basestring = (str, bytes)
+
+AF_PIPE = 255  # Right now AF_MAX == 40
+
 
 size_suffixes = {'b': 1,
                  'k': 1024,
@@ -46,9 +61,62 @@ rate_suffixes = {'bit': 1,
 
 
 ##
+# Debug
+#
+_log_configured = False
+
+
+def debug(f):
+    '''
+    Debug decorator, that logs all the function calls
+    '''
+    if os.environ.get('DEBUG', None) is None:
+        return f
+
+    global _log_configured
+    # some nosetests bug prevents the rest of this function
+    # being marked as "covered", despite it really IS; so
+    # FIXME: trace and file nosetests bug
+    # possibly related to the log capture
+    if not _log_configured:
+        _log_configured = True
+        filename = os.environ.get('DEBUG_FILE', None)
+        logging.basicConfig(filename=filename,
+                            level=logging.DEBUG)
+
+    def wrap(*argv, **kwarg):
+        tid = id(threading.current_thread())
+        bt = ''.join(traceback.format_stack()[:-1])
+        logging.debug("%s %s: bt: %s" % (tid, f.__name__, bt))
+        logging.debug("%s %s: call: %s; %s" % (tid,
+                                               f.__name__,
+                                               argv,
+                                               kwarg))
+        ret = f(*argv, **kwarg)
+        logging.debug("%s %s: ret: %s" % (tid, f.__name__, ret))
+        return ret
+
+    return wrap
+
+
+##
 # General purpose
 #
 class Dotkeys(dict):
+    '''
+    This is a sick-minded hack of dict, intended to be an eye-candy.
+    It allows to get dict's items byt dot reference:
+
+    ipdb["lo"] == ipdb.lo
+    ipdb["eth0"] == ipdb.eth0
+
+    Obviously, it will not work for some cases, like unicode names
+    of interfaces and so on. Beside of that, it introduces some
+    complexity.
+
+    But it simplifies live for old-school admins, who works with good
+    old "lo", "eth0", and like that naming schemes.
+    '''
     var_name = re.compile('^[a-zA-Z_]+[a-zA-Z_0-9]*$')
 
     def __dir__(self):
@@ -104,9 +172,69 @@ def map_namespace(prefix, ns):
     return (by_name, by_value)
 
 
+def _fnv1_python2(data):
+    '''
+    FNV1 -- 32bit hash, python2 version
+
+    @param data: input
+    @type data: bytes
+
+    @return: 32bit int hash
+    @rtype: int
+
+    See: http://www.isthe.com/chongo/tech/comp/fnv/index.html
+    '''
+    hval = 0x811c9dc5
+    for i in range(len(data)):
+        hval *= 0x01000193
+        hval ^= struct.unpack('B', data[i])[0]
+    return hval & 0xffffffff
+
+
+def _fnv1_python3(data):
+    '''
+    FNV1 -- 32bit hash, python3 version
+
+    @param data: input
+    @type data: bytes
+
+    @return: 32bit int hash
+    @rtype: int
+
+    See: http://www.isthe.com/chongo/tech/comp/fnv/index.html
+    '''
+    hval = 0x811c9dc5
+    for i in range(len(data)):
+        hval *= 0x01000193
+        hval ^= data[i]
+    return hval & 0xffffffff
+
+
+if sys.version[0] == '3':
+    fnv1 = _fnv1_python3
+else:
+    fnv1 = _fnv1_python2
+
+
+def uuid32():
+    '''
+    Return 32bit UUID, based on the current time and pid.
+
+    @return: 32bit int uuid
+    @rtype: int
+    '''
+    return fnv1(struct.pack('QQ',
+                            int(time.time() * 1000),
+                            os.getpid()))
+
+
 def hexdump(payload, length=0):
     '''
     Represent byte string as hex -- for debug purposes
     '''
-    return ':'.join('{0:02x}'.format(ord(c))
-                    for c in payload[:length] or payload)
+    if sys.version[0] == '3':
+        return ':'.join('{0:02x}'.format(c)
+                        for c in payload[:length] or payload)
+    else:
+        return ':'.join('{0:02x}'.format(ord(c))
+                        for c in payload[:length] or payload)

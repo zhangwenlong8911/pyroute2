@@ -16,8 +16,8 @@
 # 	along with PyVFS; if not, write to the Free Software
 # 	Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-version ?= "0.1"
-release ?= "0.1.11"
+version ?= "0.2"
+release ?= "0.2.7"
 python ?= "python"
 
 ifdef root
@@ -49,12 +49,6 @@ clean: clean-version
 	rm -rf tests/cover
 	find . -name "*pyc" -exec rm -f "{}" \;
 
-check:
-	for i in pyroute2 ; \
-		do pep8 $$i || exit 1; \
-		pyflakes $$i || exit 1; \
-		done
-
 setup.py docs/conf.py:
 	gawk -v version=${version} -v release=${release} -v flavor=${flavor}\
 		-f configure.gawk $@.in >$@
@@ -70,12 +64,12 @@ update-version: setup.py docs/conf.py
 docs: clean force-version
 	cp README.md docs/general.rst
 	cp CHANGELOG.md docs/changelog.rst
-	make -C docs html
+	export PYTHONPATH=`pwd`; make -C docs html
 
 test:
-	@flake8 .
+	@flake8 --exclude=docs .
 	@export PYTHONPATH=`pwd`; cd tests; \
-		nosetests -v ${pdb} \
+		nosetests$$PYVERSION -v ${pdb} \
 			--with-coverage \
 			--cover-package=pyroute2 \
 			${coverage} \

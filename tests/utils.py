@@ -47,7 +47,8 @@ def create_link(name, kind):
 def _check_output(*argv):
     # we can not use check_output, as it does not exist in 2.6
     process = subprocess.Popen(argv, stdout=subprocess.PIPE)
-    return process.communicate()[0].split('\n')
+    ret = process.communicate()
+    return ret[0].decode('ascii').split('\n')
 
 
 def grep(command, pattern=None):
@@ -86,6 +87,15 @@ def get_ip_link():
 def get_ip_route():
     ret = []
     out = _check_output('ip', '-4', 'ro', 'li', 'ta', '255')
+    for string in out:
+        if len(string):
+            ret.append(string)
+    return ret
+
+
+def get_ip_rules(proto='-4'):
+    ret = []
+    out = _check_output('ip', proto, 'rule', 'show')
     for string in out:
         if len(string):
             ret.append(string)

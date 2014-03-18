@@ -5,8 +5,10 @@ import struct
 from pyroute2.common import size_suffixes
 from pyroute2.common import time_suffixes
 from pyroute2.common import rate_suffixes
+from pyroute2.common import basestring
 from pyroute2.netlink.generic import nlmsg
 from pyroute2.netlink.generic import nla
+
 
 LINKLAYER_UNSPEC = 0
 LINKLAYER_ETHERNET = 1
@@ -75,6 +77,13 @@ def _time2tick(t):
 def _calc_xmittime(rate, size):
     # The current code is ported from tc utility
     return round(_time2tick(TIME_UNITS_PER_SEC * (float(size) / rate)))
+
+
+def _percent2u32(pct):
+    '''xlate a percentage to an uint32 value
+    0% -> 0
+    100% -> 2**32 - 1'''
+    return int((2**32 - 1)*pct/100)
 
 
 def _red_eval_ewma(qmin, burst, avpkt):
@@ -147,26 +156,57 @@ def get_tbf_parameters(kwarg):
                       ['TCA_TBF_RTAB', True]]}
 
 
+def _get_filter_police_parameter(kwarg):
+    # if no limit specified, set it to zero to make
+    # the next call happy
+    kwarg['limit'] = kwarg.get('limit', 0)
+    tbfp = _get_rate_parameters(kwarg)
+    # create an alias -- while TBF uses 'buffer', rate
+    # policy uses 'burst'
+    tbfp['burst'] = tbfp['buffer']
+    # action resolver
+    actions = nla_plus_police.police.police_tbf.actions
+    tbfp['action'] = actions[kwarg.get('action', 'reclassify')]
+    police = [['TCA_POLICE_TBF', tbfp],
+              ['TCA_POLICE_RATE', True]]
+    return police
+
+
 def get_u32_parameters(kwarg):
     ret = {'attrs': []}
 
     if kwarg.get('rate'):
-        # if no limit specified, set it to zero to make
-        # the next call happy
-        kwarg['limit'] = kwarg.get('limit', 0)
-        tbfp = _get_rate_parameters(kwarg)
-        # create an alias -- while TBF uses 'buffer', rate
-        # policy uses 'burst'
-        tbfp['burst'] = tbfp['buffer']
-        # action resolver
-        actions = nla_plus_police.police.police_tbf.actions
-        tbfp['action'] = actions[kwarg['action']]
-        police = [['TCA_POLICE_TBF', tbfp],
-                  ['TCA_POLICE_RATE', True]]
-        ret['attrs'].append(['TCA_U32_POLICE', {'attrs': police}])
+        ret['attrs'].append([
+            'TCA_U32_POLICE',
+            {'attrs': _get_filter_police_parameter(kwarg)}
+        ])
 
     ret['attrs'].append(['TCA_U32_CLASSID', kwarg['target']])
     ret['attrs'].append(['TCA_U32_SEL', {'keys': kwarg['keys']}])
+
+    return ret
+
+
+def get_fw_parameters(kwarg):
+    ret = {'attrs': []}
+    attrs_map = (
+        ('classid', 'TCA_FW_CLASSID'),
+        ('act', 'TCA_FW_ACT'),
+        #('police', 'TCA_FW_POLICE'), # Handled in _get_filter_police_parameter
+        ('indev', 'TCA_FW_INDEV'),
+        ('mask', 'TCA_FW_MASK'),
+    )
+
+    if kwarg.get('rate'):
+        ret['attrs'].append([
+            'TCA_FW_POLICE',
+            {'attrs': _get_filter_police_parameter(kwarg)}
+        ])
+
+    for k, v in attrs_map:
+        r = kwarg.get(k, None)
+        if r is not None:
+            ret['attrs'].append([v, r])
 
     return ret
 
@@ -206,60 +246,131 @@ def get_sfq_parameters(kwarg):
     return kwarg
 
 
-def get_htb_parameters(kwarg):
-    rate2quantum = kwarg.get('r2q', 0xa)
-    version = kwarg.get('version', 3)
-    defcls = kwarg.get('default', 0x10)
-    parent = kwarg.get('parent', None)
-    #
-    rate = _get_rate(kwarg.get('rate', None))
-    ceil = _get_rate(kwarg.get('ceil', 0)) or rate
+def get_htb_class_parameters(kwarg):
     #
     prio = kwarg.get('prio', 0)
     mtu = kwarg.get('mtu', 1600)
     mpu = kwarg.get('mpu', 0)
     overhead = kwarg.get('overhead', 0)
-    # linklayer = kwarg.get('linklayer', None)
     quantum = kwarg.get('quantum', 0)
     #
+    rate = _get_rate(kwarg.get('rate', None))
+    ceil = _get_rate(kwarg.get('ceil', 0)) or rate
+
     burst = kwarg.get('burst', None) or \
         kwarg.get('maxburst', None) or \
         kwarg.get('buffer', None)
+
     if rate is not None:
         if burst is None:
             burst = rate / _get_hz() + mtu
         burst = _calc_xmittime(rate, burst)
+
     cburst = kwarg.get('cburst', None) or \
         kwarg.get('cmaxburst', None) or \
         kwarg.get('cbuffer', None)
+
     if ceil is not None:
         if cburst is None:
             cburst = ceil / _get_hz() + mtu
         cburst = _calc_xmittime(ceil, cburst)
 
-    if parent is not None:
-        # HTB class
-        ret = [['TCA_HTB_PARMS', {'buffer': burst,
-                                  'cbuffer': cburst,
-                                  'quantum': quantum,
-                                  'prio': prio,
-                                  'rate': rate,
-                                  'ceil': ceil,
-                                  'ceil_overhead': overhead,
-                                  'rate_overhead': overhead,
-                                  'rate_mpu': mpu,
-                                  'ceil_mpu': mpu}],
-               ['TCA_HTB_RTAB', True],
-               ['TCA_HTB_CTAB', True]]
+    return {'attrs': [['TCA_HTB_PARMS', {'buffer': burst,
+                                         'cbuffer': cburst,
+                                         'quantum': quantum,
+                                         'prio': prio,
+                                         'rate': rate,
+                                         'ceil': ceil,
+                                         'ceil_overhead': overhead,
+                                         'rate_overhead': overhead,
+                                         'rate_mpu': mpu,
+                                         'ceil_mpu': mpu}],
+                      ['TCA_HTB_RTAB', True],
+                      ['TCA_HTB_CTAB', True]]}
 
+
+def get_htb_parameters(kwarg):
+    rate2quantum = kwarg.get('r2q', 0xa)
+    version = kwarg.get('version', 3)
+    defcls = kwarg.get('default', 0x10)
+
+    return {'attrs': [['TCA_HTB_INIT', {'debug': 0,
+                                        'defcls': defcls,
+                                        'direct_pkts': 0,
+                                        'rate2quantum': rate2quantum,
+                                        'version': version}]]}
+
+
+def get_netem_parameters(kwarg):
+    delay = _time2tick(kwarg.get('delay', 0))  # in microsecond
+    limit = kwarg.get('limit', 1000)  # fifo limit (packets) see netem.c:230
+    loss = _percent2u32(kwarg.get('loss', 0))  # int percentage
+    gap = kwarg.get('gap', 0)
+    duplicate = kwarg.get('duplicate', 0)
+    jitter = _time2tick(kwarg.get('jitter', 0))  # in microsecond
+
+    opts = {
+        'delay': delay,
+        'limit': limit,
+        'loss': loss,
+        'gap': gap,
+        'duplicate': duplicate,
+        'jitter': jitter,
+        'attrs': []
+    }
+
+    # correlation (delay, loss, duplicate)
+    delay_corr = _percent2u32(kwarg.get('delay_corr', 0))
+    loss_corr = _percent2u32(kwarg.get('loss_corr', 0))
+    dup_corr = _percent2u32(kwarg.get('dup_corr', 0))
+    if delay_corr or loss_corr or dup_corr:
+        # delay_corr requires that both jitter and delay are != 0
+        if delay_corr and not (delay and jitter):
+            raise Exception('delay correlation requires delay'
+                            ' and jitter to be set')
+        # loss correlation and loss
+        if loss_corr and not loss:
+            raise Exception('loss correlation requires loss to be set')
+        # duplicate correlation and duplicate
+        if dup_corr and not duplicate:
+            raise Exception('duplicate correlation requires '
+                            'duplicate to be set')
+
+        opts['attrs'].append(['TCA_NETEM_CORR', {'delay_corr': delay_corr,
+                                                 'loss_corr': loss_corr,
+                                                 'dup_corr': dup_corr}])
+
+    # reorder (probability, correlation)
+    prob_reorder = _percent2u32(kwarg.get('prob_reorder', 0))
+    corr_reorder = _percent2u32(kwarg.get('corr_reorder', 0))
+    if prob_reorder != 0:
+        # gap defaults to 1 if equal to 0
+        if gap == 0:
+            opts['gap'] = gap = 1
+        opts['attrs'].append(['TCA_NETEM_REORDER',
+                             {'prob_reorder': prob_reorder,
+                              'corr_reorder': corr_reorder}])
     else:
-        # HTB root
-        ret = [['TCA_HTB_INIT', {'debug': 0,
-                                 'defcls': defcls,
-                                 'direct_pkts': 0,
-                                 'rate2quantum': rate2quantum,
-                                 'version': version}]]
-    return {'attrs': ret}
+        if gap != 0:
+            raise Exception('gap can only be set when prob_reorder is set')
+        elif corr_reorder != 0:
+            raise Exception('corr_reorder can only be set when '
+                            'prob_reorder is set')
+
+    # corrupt (probability, correlation)
+    prob_corrupt = _percent2u32(kwarg.get('prob_corrupt', 0))
+    corr_corrupt = _percent2u32(kwarg.get('corr_corrupt', 0))
+    if prob_corrupt:
+        opts['attrs'].append(['TCA_NETEM_CORRUPT',
+                             {'prob_corrupt': prob_corrupt,
+                              'corr_corrupt': corr_corrupt}])
+    elif corr_corrupt != 0:
+        raise Exception('corr_corrupt can only be set when '
+                        'prob_corrupt is set')
+
+    # TODO
+    # delay distribution (dist_size, dist_data)
+    return opts
 
 
 class nla_plus_rtab(nla):
@@ -316,9 +427,9 @@ class nla_plus_rtab(nla):
         fields = (('value', 's'), )
 
         def encode(self):
-            parms = self.parent.get_attr('TCA_TBF_PARMS') or \
-                self.parent.get_attr('TCA_HTB_PARMS') or \
-                self.parent.get_attr('TCA_POLICE_TBF')
+            parms = self.parent.get_encoded('TCA_TBF_PARMS') or \
+                self.parent.get_encoded('TCA_HTB_PARMS') or \
+                self.parent.get_encoded('TCA_POLICE_TBF')
             if parms is not None:
                 self.value = getattr(parms, self.__class__.__name__)
                 self['value'] = struct.pack('I' * 256, *self.value)
@@ -463,6 +574,8 @@ class tcmsg(nlmsg):
                 return self.options_sfq_v0
         elif kind == 'htb':
             return self.options_htb
+        elif kind == 'netem':
+            return self.options_netem
         elif kind == 'u32':
             return self.options_u32
         elif kind == 'fw':
@@ -505,13 +618,45 @@ class tcmsg(nlmsg):
                       ('level', 'I'),
                       ('prio', 'I'))
 
+    class options_netem(nla):
+        nla_map = (('TCA_NETEM_UNSPEC', 'none'),
+                   ('TCA_NETEM_CORR', 'netem_corr'),
+                   ('TCA_NETEM_DELAY_DIST', 'none'),
+                   ('TCA_NETEM_REORDER', 'netem_reorder'),
+                   ('TCA_NETEM_CORRUPT', 'netem_corrupt'),
+                   ('TCA_NETEM_LOSS', 'none'),
+                   ('TCA_NETEM_RATE', 'none'))
+
+        fields = (('delay', 'I'),
+                  ('limit', 'I'),
+                  ('loss', 'I'),
+                  ('gap', 'I'),
+                  ('duplicate', 'I'),
+                  ('jitter', 'I'))
+
+        class netem_corr(nla):
+            '''correlation'''
+            fields = (('delay_corr', 'I'),
+                      ('loss_corr', 'I'),
+                      ('dup_corr', 'I'))
+
+        class netem_reorder(nla):
+            '''reorder has probability and correlation'''
+            fields = (('prob_reorder', 'I'),
+                      ('corr_reorder', 'I'))
+
+        class netem_corrupt(nla):
+            '''corruption has probability and correlation'''
+            fields = (('prob_corrupt', 'I'),
+                      ('corr_corrupt', 'I'))
+
     class options_fw(nla_plus_police):
         nla_map = (('TCA_FW_UNSPEC', 'none'),
                    ('TCA_FW_CLASSID', 'uint32'),
-                   ('TCA_FW_POLICE', 'police'),
-                   ('TCA_FW_INDEV', 'hex'),
-                   ('TCA_FW_ACT', 'hex'),
-                   ('TCA_FW_MASK', 'hex'))
+                   ('TCA_FW_POLICE', 'police'),  # TODO string?
+                   ('TCA_FW_INDEV', 'hex'),  # TODO string
+                   ('TCA_FW_ACT', 'hex'),  # TODO
+                   ('TCA_FW_MASK', 'uint32'))
 
     class options_u32(nla_plus_police):
         nla_map = (('TCA_U32_UNSPEC', 'none'),

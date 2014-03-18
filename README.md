@@ -1,14 +1,20 @@
 pyroute2
 ========
 
-Python netlink library. The main goal of the project is to
-implement complete NETLINK\_ROUTE family as well as several
-other families (NETLINK\_NETFILTER etc.)
+Pyroute2 is a pure Python netlink and messaging/RPC library.
+It requires only Python stdlib, no 3rd party libraries. Later
+it can change, but the deps tree will remain as simple, as
+it is possible.
 
-Current feature status see in STATUS.md
+The library contains all you need to build either one-node,
+or distributed netlink-related solutions. It consists of two
+major parts:
 
-sample
-------
+* Netlink parsers: NETLINK\_ROUTE, TASKSTATS, etc.
+* Messaging infrastructure: broker, clients, etc.
+
+RTNETLINK sample
+----------------
 
 More samples you can read in the project documentation.
 Low-level interface::
@@ -33,13 +39,66 @@ High-level transactional interface, IPDB::
     # transaction will be started with `with` statement
     # and will be committed at the end of the block
     with ip.create(kind='bridge', ifname='rhev') as i:
-        i.add_port(ip.em1)
-        i.add_port(ip.em2)
+        i.add_port(ip.interfaces.em1)
+        i.add_port(ip.interfaces.em2)
         i.add_ip('10.0.0.2/24')
 
 
 The project contains several modules for different types of
 netlink messages, not only RTNL.
+
+RPC sample
+----------
+
+Actually, either side can act as a server or a client, there
+is no pre-defined roles. But for simplicity, they're referred
+here as "server" and "client".
+
+Server side::
+
+    from pyroute2.rpc import Node
+    from pyroute2.rpc import public
+
+
+    class Namespace(object):
+        '''
+        This class acts as a namespace, that contains
+        methods to be published via RPC. Any method,
+        available through RPC, must be marked as @public.
+        '''
+
+        @public
+        def echo(self, msg):
+            '''
+            Simple echo method, that returns a modified
+            string.
+            '''
+            return '%s passed' % (msg)
+
+    # start the RPC node and register the namespace
+    node = Node()
+    node.register(Namespace())
+
+    # listen for network connections
+    node.serve('tcp://localhost:9824')
+
+    # wait for exit -- activity will be done in the
+    # background thread
+    raw_input(' hit return to exit >> ')
+
+Client side::
+
+    from pyroute2.rpc import Node
+
+    # start the RPC node and connect to the 'server'
+    node = Node()
+    proxy = node.connect('tcp://localhost:9824')
+
+    # call a remote method through the proxy instance
+    print(proxy.echo('test'))
+
+
+It will print out `test passed`.
 
 installation
 ------------
@@ -52,8 +111,6 @@ requires
 Python >= 2.6
 
   * test reqs (optional): **python-coverage**, **python-nose**
-  * plugin reqs (optional):
-    * ptrace: **python-ptrace**
 
 links
 -----

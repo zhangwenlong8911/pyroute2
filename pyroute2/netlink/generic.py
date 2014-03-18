@@ -1,11 +1,14 @@
-
+import traceback
+import logging
 import socket
 import struct
 import types
+import sys
 import io
 import re
 
 from pyroute2.common import hexdump
+from pyroute2.common import basestring
 
 _letters = re.compile('[A-Za-z]')
 _fmt_letters = re.compile('[^!><@=][!><@=]')
@@ -130,18 +133,13 @@ class nlmsg_base(dict):
 
     fields = []                  # data field names, to build a dictionary
     header = None                # optional header class
+    pack = None                  # pack pragma
     nla_map = {}                 # NLA mapping
 
     def __init__(self, buf=None, length=None, parent=None, debug=False):
         dict.__init__(self)
         for i in self.fields:
             self[i[0]] = 0  # FIXME: only for number values
-        if isinstance(buf, basestring):
-            b = io.BytesIO()
-            b.write(buf)
-            b.seek(0)
-            buf = b
-        self.buf = buf or io.BytesIO()
         self.raw = None
         self.debug = debug
         self.length = length or 0
@@ -151,9 +149,28 @@ class nlmsg_base(dict):
         self['attrs'] = []
         self['value'] = NotInitialized
         self.value = NotInitialized
+        self.register_nlas()
+        self.reset(buf)
         if self.header is not None:
             self['header'] = self.header(self.buf)
-        self.register_nlas()
+
+    def copy(self):
+        buf = io.BytesIO()
+        buf.length = buf.write(self.raw)
+        buf.seek(0)
+        ret = type(self)(buf)
+        ret.decode()
+        return ret
+
+    def reset(self, buf=None):
+        if isinstance(buf, basestring):
+            b = io.BytesIO()
+            b.write(buf)
+            b.seek(0)
+            buf = b
+        self.buf = buf or io.BytesIO()
+        if 'header' in self:
+            self['header'].buf = self.buf
 
     def __eq__(self, value):
         '''
@@ -229,22 +246,31 @@ class nlmsg_base(dict):
                 raise NetlinkHeaderDecodeError(e)
         # decode the data
         try:
-            for i in self.fields:
-                name = i[0]
-                fmt = i[1]
+            if self.pack == 'struct':
+                names = []
+                formats = []
+                for field in self.fields:
+                    names.append(field[0])
+                    formats.append(field[1])
+                fields = ((','.join(names), ''.join(formats)), )
+            else:
+                fields = self.fields
+
+            for field in fields:
+                name = field[0]
+                fmt = field[1]
 
                 # 's' and 'z' can be used only in connection with
                 # length, encoded in the header
-                if i[1] in ('s', 'z'):
+                if field[1] in ('s', 'z'):
                     fmt = '%is' % (self.length - 4)
 
                 size = struct.calcsize(fmt)
-                offset = self.buf.tell()
                 raw = self.buf.read(size)
                 actual_size = len(raw)
 
                 # FIXME: adjust string size again
-                if i[1] in ('s', 'z'):
+                if field[1] in ('s', 'z'):
                     size = actual_size
                     fmt = '%is' % (actual_size)
                 if size == actual_size:
@@ -252,15 +278,11 @@ class nlmsg_base(dict):
                     if len(value) == 1:
                         self[name] = value[0]
                         # cut zero-byte from z-strings
-                        if i[1] == 'z' and self[name][-1] == '\0':
+                        # 0x00 -- python3; '\0' -- python2
+                        if field[1] == 'z' and self[name][-1] in (0x00, '\0'):
                             self[name] = self[name][:-1]
                     else:
-                        self[name] = value
-
-                    if self.debug and name != 'value':
-                        self[name] = {'value': self[name],
-                                      'header': {'offset': offset,
-                                                 'length': actual_size}}
+                        self.update(dict(zip(name.split(","), value)))
 
                 else:
                     # FIXME: log an error
@@ -290,23 +312,35 @@ class nlmsg_base(dict):
             self['header'].reserve()
 
         if self.getvalue() is not None:
-            try:
-                payload = b''
-                for i in self.fields:
-                    name = i[0]
-                    fmt = i[1]
 
-                    if fmt == 's':
-                        length = len(self[name])
-                        fmt = '%is' % (length)
-                    elif fmt == 'z':
-                        length = len(self[name]) + 1
-                        fmt = '%is' % (length)
+            payload = b''
+            for i in self.fields:
+                name = i[0]
+                fmt = i[1]
+                value = self[name]
 
-                    payload += struct.pack(fmt, self[name])
+                if fmt == 's':
+                    length = len(value)
+                    fmt = '%is' % (length)
+                elif fmt == 'z':
+                    length = len(value) + 1
+                    fmt = '%is' % (length)
 
-            except Exception as e:
-                raise e
+                # in python3 we should force it
+                if sys.version[0] == '3':
+                    if isinstance(value, str):
+                        value = bytes(value, 'utf-8')
+                    elif isinstance(value, float):
+                        value = int(value)
+
+                try:
+                    payload += struct.pack(fmt, value)
+                except struct.error:
+                    logging.error(traceback.format_exc())
+                    logging.error("error pack: %s %s %s" %
+                                  (fmt, value, type(value)))
+                    raise
+
             diff = NLMSG_ALIGN(len(payload)) - len(payload)
             self.buf.write(payload)
             self.buf.write(b'\0' * diff)
@@ -332,21 +366,29 @@ class nlmsg_base(dict):
             self['value'] = value
             self.value = value
 
-    def get_attr(self, attr):
+    def get_encoded(self, attr, default=None):
         '''
-        Return first attr by name or None
+        Return the first encoded NLA by name
         '''
-        attrs = self.get_attrs(attr)
+        return self.get_attr(attr, default, 'encoded')
+
+    def get_attr(self, attr, default=None, fmt='raw'):
+        '''
+        Return the first attr by name or None
+        '''
+        attrs = self.get_attrs(attr, fmt)
         if attrs:
             return attrs[0]
         else:
-            return None
+            return default
 
-    def get_attrs(self, attr):
+    def get_attrs(self, attr, fmt='raw'):
         '''
         Return attrs by name
         '''
-        return [i[1] for i in self['attrs'] if i[0] == attr]
+        fmt_map = {'raw': 1,
+                   'encoded': 2}
+        return [i[fmt_map[fmt]] for i in self['attrs'] if i[0] == attr]
 
     def getvalue(self):
         '''
@@ -367,6 +409,17 @@ class nlmsg_base(dict):
         '''
         Convert 'nla_map' tuple into two dictionaries for mapping
         and reverse mapping of NLA types.
+        ex: given
+        nla_map = (('TCA_HTB_UNSPEC', 'none'),
+                   ('TCA_HTB_PARMS', 'htb_parms'),
+                   ('TCA_HTB_INIT', 'htb_glob'))
+        creates:
+        t_nla_map = {0: (<class 'pyroute2...none'>, 'TCA_HTB_UNSPEC'),
+                     1: (<class 'pyroute2...htb_parms'>, 'TCA_HTB_PARMS'),
+                     2: (<class 'pyroute2...htb_glob'>, 'TCA_HTB_INIT')}
+        r_nla_map = {'TCA_HTB_UNSPEC': (<class 'pyroute2...none'>, 0),
+                     'TCA_HTB_PARMS': (<class 'pyroute2...htb_parms'>, 1),
+                     'TCA_HTB_INIT': (<class 'pyroute2...htb_glob'>, 2)}
         '''
         # clean up NLA mappings
         self.t_nla_map = {}
@@ -396,17 +449,19 @@ class nlmsg_base(dict):
                 if isinstance(msg_class, types.MethodType):
                     # if it is a function -- use it to get the class
                     msg_class = msg_class()
+                # encode NLA
+                nla = msg_class(self.buf, parent=self)
+                nla['header']['type'] = msg_type
+                nla.setvalue(i[1])
                 try:
-                    # encode NLA
-                    nla = msg_class(self.buf, parent=self)
-                    nla['header']['type'] = msg_type
-                    nla.setvalue(i[1])
                     nla.encode()
-                    i[1] = nla
                 except:
-                    # FIXME
-                    import traceback
-                    traceback.print_exc()
+                    raise
+                else:
+                    if len(i) == 2:
+                        i.append(nla)
+                    elif len(i) == 3:
+                        i[2] = nla
 
     def decode_nlas(self):
         while self.buf.tell() < (self.offset + self.length):
@@ -429,25 +484,27 @@ class nlmsg_base(dict):
                 # and the name
                 msg_name = self.t_nla_map[msg_type][1]
 
+                # decode NLA
+                nla = msg_class(self.buf, length, self,
+                                debug=self.debug)
                 try:
-                    # decode NLA
-                    nla = msg_class(self.buf, length, self, debug=self.debug)
                     nla.decode()
-                    msg_value = nla.getvalue()
                 except:
                     # FIXME
                     self.buf.seek(init)
                     msg_value = hexdump(self.buf.read(length))
+                else:
+                    msg_value = nla.getvalue()
 
                 if self.debug:
-                    self['attrs'].append((msg_name,
+                    self['attrs'].append([msg_name,
                                           msg_value,
                                           msg_type,
                                           length,
-                                          init))
+                                          init])
                 else:
-                    self['attrs'].append((msg_name,
-                                          msg_value))
+                    self['attrs'].append([msg_name,
+                                          msg_value])
 
             # fix the offset
             self.buf.seek(init + NLMSG_ALIGN(length))
@@ -521,13 +578,15 @@ class nlmsg_atoms(nlmsg_base):
         fields = [('value', '=6s')]
 
         def encode(self):
-            self['value'] = ''.join((chr(int(i, 16)) for i in
-                                     self.value.split(':')))
+            self['value'] = struct.pack('BBBBBB',
+                                        *[int(i, 16) for i in
+                                          self.value.split(':')])
             nla_base.encode(self)
 
         def decode(self):
             nla_base.decode(self)
-            self.value = ':'.join('%02x' % (ord(i)) for i in self['value'])
+            self.value = ':'.join('%02x' % (i) for i in
+                                  struct.unpack('BBBBBB', self['value']))
 
     class hex(nla_base):
         '''
@@ -539,12 +598,31 @@ class nlmsg_atoms(nlmsg_base):
             nla_base.decode(self)
             self.value = hexdump(self['value'])
 
+    class cdata(nla_base):
+        '''
+        Binary data
+        '''
+        fields = [('value', 's')]
+
     class asciiz(nla_base):
         '''
         Zero-terminated string.
         '''
         # FIXME: move z-string hacks from general decode here?
         fields = [('value', 'z')]
+
+        def encode(self):
+            if isinstance(self['value'], str) and sys.version[0] == '3':
+                self['value'] = bytes(self['value'], 'utf-8')
+            nla_base.encode(self)
+
+        def decode(self):
+            nla_base.decode(self)
+            try:
+                assert sys.version[0] == '3'
+                self.value = self['value'].decode('utf-8')
+            except (AssertionError, UnicodeDecodeError):
+                self.value = self['value']
 
 
 class nla(nla_base, nlmsg_atoms):
@@ -585,5 +663,38 @@ class ctrlmsg(genlmsg):
                ('CTRL_ATTR_HDRSIZE', 'hex'),
                ('CTRL_ATTR_MAXATTR', 'hex'),
                ('CTRL_ATTR_OPS', 'hex'),
-               ('CTRL_ATTR_MCAST_GROUPS', 'hex'),
-               ('IPR_ATTR_SECRET', 'asciiz'))
+               ('CTRL_ATTR_MCAST_GROUPS', 'hex'))
+
+
+class mgmtmsg(ctrlmsg):
+    '''
+    Messaging system control messages
+    '''
+    nla_map = (('IPR_ATTR_SECRET', 'asciiz'),
+               ('IPR_ATTR_HOST', 'asciiz'),
+               ('IPR_ATTR_SSL_KEY', 'asciiz'),
+               ('IPR_ATTR_SSL_CERT', 'asciiz'),
+               ('IPR_ATTR_SSL_CA', 'asciiz'),
+               ('IPR_ATTR_ADDR', 'uint32'),
+               ('IPR_ATTR_ERROR', 'asciiz'),
+               ('IPR_ATTR_CID', 'uint32'),
+               ('IPR_ATTR_KEY', 'u32key'),
+               ('IPR_ATTR_UUID', 'asciiz'))
+
+    class u32key(nla):
+        fields = (('offset', 'I'),
+                  ('key', 'I'),
+                  ('mask', 'I'))
+
+
+class envmsg(nlmsg):
+    fields = (('dst', 'I'),
+              ('dport', 'I'),
+              ('src', 'I'),
+              ('sport', 'I'),
+              ('ttl', 'H'),
+              ('reserved', 'H'),
+              ('id', '16s'))
+
+    nla_map = (('IPR_ATTR_CDATA', 'cdata'),
+               ('IPR_ATTR_CNAME', 'asciiz'))

@@ -13,7 +13,11 @@ Quick start:
 import uuid
 import platform
 import threading
-from Queue import Empty
+try:
+    from Queue import Empty
+except ImportError:
+    from queue import Empty
+
 from socket import AF_INET
 from socket import AF_INET6
 from pyroute2.common import Dotkeys
@@ -229,6 +233,7 @@ class Transactional(Dotkeys):
         self.uid = uuid.uuid4()
         self.ipdb = ipdb
         self.last_error = None
+        self._callbacks = []
         self._fields = []
         self._tids = []
         self._transactions = {}
@@ -236,6 +241,14 @@ class Transactional(Dotkeys):
         self._write_lock = threading.RLock()
         self._direct_state = State(self._write_lock)
         self._linked_sets = set()
+
+    def register_callback(self, callback):
+        self._callbacks.append(callback)
+
+    def unregister_callback(self, callback):
+        for cb in tuple(self._callbacks):
+            if callback == cb:
+                self._callbacks.pop(self._callbacks.index(cb))
 
     def pick(self, detached=True):
         '''
@@ -274,7 +287,7 @@ class Transactional(Dotkeys):
                 self.commit()
             except Exception as e:
                 self.last_error = e
-                raise e
+                raise
 
     def __repr__(self):
         res = {}
@@ -446,7 +459,6 @@ class Interface(Transactional):
             self['ports'] = LinkedSet()
             for i in nla_fields:
                 self[i] = None
-            self['flags'] = 0
             for i in ('state', 'change', 'mask'):
                 del self[i]
         # 8<-----------------------------------
@@ -504,9 +516,14 @@ class Interface(Transactional):
 
     @update
     def add_ip(self, direct, ip, mask=None):
+        # split mask
         if mask is None:
             ip, mask = ip.split('/')
             mask = int(mask, 0)
+        # FIXME: make it more generic
+        # skip IPv6 link-local addresses
+        if ip[:4] == 'fe80' and mask == 64:
+            return
         if not direct:
             transaction = self.last()
             transaction.add_ip(ip, mask)
@@ -546,8 +563,8 @@ class Interface(Transactional):
         else:
             # FIXME: do something with it, please
             if self.ipdb and _ANCIENT_PLATFORM and \
-                    'master' in self.ipdb[port]:
-                self.ipdb[port].del_item('master')
+                    'master' in self.ipdb.interfaces[port]:
+                self.ipdb.interfaces[port].del_item('master')
             self['ports'].remove(port)
 
     def reload(self):
@@ -566,7 +583,7 @@ class Interface(Transactional):
         Commit transaction. In the case of exception all
         changes applied during commit will be reverted.
         '''
-        e = None
+        error = None
         added = None
         removed = None
         if tid:
@@ -580,7 +597,7 @@ class Interface(Transactional):
             self.ipdb._links_event.clear()
             try:
                 self.nl.link('add', **request)
-            except Exception as e:
+            except Exception:
                 # on failure, invalidate the interface and detach it
                 # from the parent
                 # 1. drop the IPRoute() link
@@ -595,7 +612,7 @@ class Interface(Transactional):
                 # 4. the rest
                 self._mode = 'invalid'
                 # raise the exception
-                raise e
+                raise
 
             # all is OK till now, so continue
             # we do not know what to load, so load everything
@@ -622,7 +639,7 @@ class Interface(Transactional):
                 except NetlinkError as x:
                     # bypass only errno 99, 'Cannot assign address'
                     if x.code != 99:
-                        raise x
+                        raise
 
             for i in added['ipaddr']:
                 self.nl.addr('add', self['index'], i[0], i[1])
@@ -656,7 +673,7 @@ class Interface(Transactional):
                     request[key] = added[key]
 
             # apply changes only if there is something to apply
-            if request:
+            if any([request[x] is not None for x in request]):
                 self.nl.link('set', index=self['index'], **request)
 
             # 8<---------------------------------------------
@@ -674,6 +691,14 @@ class Interface(Transactional):
             if rollback:
                 assert _FAIL_ROLLBACK & _FAIL_MASK
             else:
+
+                # 8<-----------------------------------------
+                # Iterate callback chain
+                for cb in self._callbacks:
+                    # An exception will rollback the transaction
+                    cb(snapshot, transaction)
+                # 8<-----------------------------------------
+
                 assert _FAIL_COMMIT & _FAIL_MASK
 
         except Exception as e:
@@ -703,7 +728,17 @@ class Interface(Transactional):
                         for i in added['ipaddr']:
                             self['ipaddr'].add(i)
                 # 8<-----------------------------------------
-                self.commit(transaction=snapshot, rollback=True)
+                ret = self.commit(transaction=snapshot, rollback=True)
+                # if some error was returned by the internal
+                # closure, substitute the initial one
+                if ret is not None:
+                    error = ret
+                else:
+                    error = e
+            elif isinstance(e, NetlinkError) and getattr(e, 'code', 0) == 1:
+                # It is <Operation not permitted>, catched in
+                # rollback. So return it -- see ~5 lines above
+                return e
             else:
                 # somethig went wrong during automatic rollback.
                 # that's the worst case, but it is still possible,
@@ -733,9 +768,9 @@ class Interface(Transactional):
             self.reload()
 
         # raise exception for failed transaction
-        if e is not None:
-            e.transaction = transaction
-            raise e
+        if error is not None:
+            error.transaction = transaction
+            raise error
 
     def up(self):
         '''
@@ -757,17 +792,15 @@ class Interface(Transactional):
         self['removal'] = True
 
 
-class IPDB(Dotkeys):
+class IPDB(object):
     '''
     The class that maintains information about network setup
     of the host. Monitoring netlink events allows it to react
     immediately. It uses no polling.
-
-    No methods of the class should be called directly.
     '''
 
-    def __init__(self, nl=None, host='localsystem', mode='implicit',
-                 key=None, cert=None, ca=None):
+    def __init__(self, nl=None, host=None, mode='implicit',
+                 key=None, cert=None, ca=None, iclass=Interface):
         '''
         Parameters:
             * nl -- IPRoute() reference
@@ -780,9 +813,13 @@ class IPDB(Dotkeys):
         '''
         self.nl = nl or IPRoute(host=host, key=key, cert=cert, ca=ca)
         self.mode = mode
+        self.iclass = iclass
         self._stop = False
+        self._callbacks = []
+        self._cb_threads = set()
 
         # resolvers
+        self.interfaces = Dotkeys()
         self.by_name = Dotkeys()
         self.by_index = Dotkeys()
 
@@ -794,6 +831,7 @@ class IPDB(Dotkeys):
 
         # update events
         self._links_event = threading.Event()
+        self.exclusive = threading.RLock()
 
         # load information on startup
         links = self.nl.get_links()
@@ -803,7 +841,7 @@ class IPDB(Dotkeys):
 
         # start monitoring thread
         self.nl.mirror()
-        self._mthread = threading.Thread(target=self.monitor)
+        self._mthread = threading.Thread(target=self.serve_forever)
         self._mthread.setDaemon(True)
         self._mthread.start()
 
@@ -813,11 +851,19 @@ class IPDB(Dotkeys):
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
-    def __dir__(self):
-        ret = Dotkeys.__dir__(self)
-        ret.append('by_name')
-        ret.append('by_index')
-        return ret
+    #def __dir__(self):
+    #    ret = Dotkeys.__dir__(self)
+    #    ret.append('by_name')
+    #    ret.append('by_index')
+    #    return ret
+
+    def register_callback(self, callback):
+        self._callbacks.append(callback)
+
+    def unregister_callback(self, callback):
+        for cb in tuple(self._callbacks):
+            if callback == cb:
+                self._callbacks.pop(self._callbacks.index(cb))
 
     def release(self):
         '''
@@ -846,19 +892,40 @@ class IPDB(Dotkeys):
 
         FIXME: this should be documented.
         '''
-        i = Interface(nl=self.nl, ipdb=self, mode='snapshot')
+        i = self.iclass(nl=self.nl, ipdb=self, mode='snapshot')
         i['kind'] = kind
         i['index'] = kwarg.get('index', 0)
         i['ifname'] = ifname
-        self.by_name[i['ifname']] = self[i['ifname']] = i
+        self.by_name[i['ifname']] = self.interfaces[i['ifname']] = i
         i.update(kwarg)
         i._mode = self.mode
         i.begin()
         return i
 
     def detach(self, item):
-        if item in self:
-            del self[item]
+        if item in self.interfaces:
+            del self.interfaces[item]
+
+    def wait_interface(self, action='RTM_NEWLINK', **kwarg):
+        event = threading.Event()
+
+        def cb(self, port, _action):
+            if _action != action:
+                return
+            for key in kwarg:
+                if port.get(key, None) != kwarg[key]:
+                    return
+            event.set()
+
+        # register callback prior to other things
+        self.register_callback(cb)
+        # inspect existing interfaces, as if they were created
+        for index in self.by_index:
+            cb(self, self.by_index[index], 'RTM_NEWLINK')
+        # ok, wait the event
+        event.wait()
+        # unregister callback
+        self.unregister_callback(cb)
 
     def update_links(self, links):
         '''
@@ -869,11 +936,11 @@ class IPDB(Dotkeys):
                 self.ipaddr[dev['index']] = LinkedSet()
             i = \
                 self.by_index[dev['index']] = \
-                self[dev['index']] = \
-                self.get(dev.get_attr('IFLA_IFNAME'), None) or \
-                Interface(nl=self.nl, ipdb=self, mode=self.mode)
+                self.interfaces[dev['index']] = \
+                self.interfaces.get(dev.get_attr('IFLA_IFNAME'), None) or \
+                self.iclass(nl=self.nl, ipdb=self, mode=self.mode)
             i.load(dev)
-            self[i['ifname']] = \
+            self.interfaces[i['ifname']] = \
                 self.by_name[i['ifname']] = i
             self.old_names[dev['index']] = i['ifname']
 
@@ -886,18 +953,18 @@ class IPDB(Dotkeys):
             # through /sys:
             try:
                 f = open('/sys/class/net/%s/brport/bridge/ifindex' %
-                         (self[index]['ifname']), 'r')
+                         (self.interfaces[index]['ifname']), 'r')
             except IOError:
                 return
             master = int(f.read())
             f.close()
-            self[index].set_item('master', master)
+            self.interfaces[index].set_item('master', master)
         elif master:
             master = master
         else:
             master = None
 
-        return self.get(master, None)
+        return self.interfaces.get(master, None)
 
     def update_slaves(self, links):
         '''
@@ -917,24 +984,26 @@ class IPDB(Dotkeys):
                     # we can end up in a broken state, when two
                     # masters refers to the same slave
                     for device in self.by_index:
-                        if index in self[device]['ports']:
-                            self[device].del_port(index, direct=True)
+                        if index in self.interfaces[device]['ports']:
+                            self.interfaces[device].del_port(index,
+                                                             direct=True)
                     master.add_port(index, direct=True)
                 elif msg['event'] == 'RTM_DELLINK':
                     if index in master['ports']:
                         master.del_port(index, direct=True)
             # there is NO masters for the interface, clean them if any
             else:
-                device = self[msg['index']]
+                device = self.interfaces[msg['index']]
                 master = device.if_master
                 if master is not None:
                     if 'master' in device:
                         device.del_item('master')
                     if 'link' in device:
                         device.del_item('link')
-                    if (master in self) and \
-                            (msg['index'] in self[master].ports):
-                        self[master].del_port(msg['index'], direct=True)
+                    if (master in self.interfaces) and \
+                            (msg['index'] in self.interfaces[master].ports):
+                        self.interfaces[master].del_port(msg['index'],
+                                                         direct=True)
 
     def update_addr(self, addrs, action='add'):
         '''
@@ -949,7 +1018,7 @@ class IPDB(Dotkeys):
                 except:
                     pass
 
-    def monitor(self):
+    def serve_forever(self):
         '''
         Main monitoring cycle. It gets messages from the
         default iproute queue and updates objects in the
@@ -961,24 +1030,25 @@ class IPDB(Dotkeys):
             except:
                 continue
             for msg in messages:
+                index = msg.get('index', None)
                 if msg.get('event', None) == 'RTM_NEWLINK':
-                    index = msg['index']
-                    if index in self:
+                    if index in self.interfaces:
                         # get old name
                         old = self.old_names[index]
                         # load interface from the message
-                        self[index].load(msg)
+                        self.interfaces[index].load(msg)
                         # check for new name
-                        if self[index]['ifname'] != old:
+                        if self.interfaces[index]['ifname'] != old:
                             # FIXME catch exception
                             # FIXME isolate dict updates
-                            del self[old]
+                            del self.interfaces[old]
                             del self.by_name[old]
                             if index in self.old_names:
                                 del self.old_names[index]
-                            self[self[index]['ifname']] = self[index]
-                            self.by_name[self[index]['ifname']] = self[index]
-                            self.old_names[index] = self[index]['ifname']
+                            ifname = self.interfaces[index]['ifname']
+                            self.interfaces[ifname] = self.interfaces[index]
+                            self.by_name[ifname] = self.interfaces[index]
+                            self.old_names[index] = ifname
                     else:
                         self.update_links([msg])
                     self.update_slaves([msg])
@@ -988,13 +1058,31 @@ class IPDB(Dotkeys):
                     self.update_slaves([msg])
                     if msg['change'] == 0xffffffff:
                         # FIXME catch exception
-                        self[msg['index']].sync()
-                        del self.by_name[self[msg['index']]['ifname']]
+                        ifname = self.interfaces[msg['index']]['ifname']
+                        self.interfaces[msg['index']].sync()
+                        del self.by_name[ifname]
                         del self.by_index[msg['index']]
                         del self.old_names[msg['index']]
-                        del self[self[msg['index']]['ifname']]
-                        del self[msg['index']]
+                        del self.interfaces[ifname]
+                        del self.interfaces[msg['index']]
                 elif msg.get('event', None) == 'RTM_NEWADDR':
                     self.update_addr([msg], 'add')
                 elif msg.get('event', None) == 'RTM_DELADDR':
                     self.update_addr([msg], 'remove')
+
+                # run callbacks
+                for cb in self._callbacks:
+                    t = threading.Thread(name="callback %s" % (id(cb)),
+                                         target=cb,
+                                         args=(self,
+                                               self.interfaces.get(index,
+                                                                   None),
+                                               msg['event']))
+                    t.start()
+                    self._cb_threads.add(t)
+
+                # occasionally join cb threads
+                for t in tuple(self._cb_threads):
+                    t.join(0)
+                    if not t.is_alive():
+                        self._cb_threads.remove(t)

@@ -1,7 +1,12 @@
 *.swp
 *.pyc
+*~
 docs/general.rst
 docs/_build
 tests/htmlcov
 tests/cover
 tests/.coverage
+output.html
+setup.py
+docs/conf.py
+docs/changelog.rst
