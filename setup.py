@@ -22,8 +22,10 @@ module = __import__(config.get('setup', 'setuplib'),
                     locals(),
                     ['setup'], 0)
 setup = getattr(module, 'setup')
+Extension = getattr(module, 'Extension')
 
-readme = open("README.md", "r")
+readme = open('README.md', 'r')
+send = Extension('send', sources=['modules/send.c'])
 
 
 setup(name='pyroute2',
@@ -33,6 +35,7 @@ setup(name='pyroute2',
       author_email='peter@svinota.eu',
       url='https://github.com/svinota/pyroute2',
       license='dual license GPLv2+ and Apache v2',
+      ext_modules=[send],
       packages=['pyroute2',
                 'pyroute2.config',
                 'pyroute2.dhcp',

@@ -1,4 +1,4 @@
-
+from send import send_from
 from pyroute2.common import Namespace
 from pyroute2.common import AddrPool
 from pyroute2.proxy import NetlinkProxy
@@ -79,7 +79,7 @@ class IPRSocketMixin(object):
         ret = self._sproxy.handle(msg)
         if ret is not None:
             if ret['verdict'] == 'forward':
-                return self._sendto(ret['data'], addr)
+                return send_from(self.fileno(), ret['data'])
             elif ret['verdict'] in ('return', 'error'):
                 if self._s_channel is not None:
                     return self._s_channel.send(ret['data'])
@@ -95,7 +95,9 @@ class IPRSocketMixin(object):
             else:
                 ValueError('Incorrect verdict')
 
-        return self._sendto(msg.data, addr)
+        send_from(self.fileno(), msg.data)
+        #
+        # return self._sendto(msg.data, addr)
 
 
 class IPRSocket(IPRSocketMixin, NetlinkSocket):
