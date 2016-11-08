@@ -590,7 +590,7 @@ class IPDB(object):
         self._loaded = set()
         self._mthread = None
         self._nl_own = nl is None
-        self._nl_async = config.ipdb_nl_async if nl_async is None else True
+        self._nl_async = config.ipdb_nl_async if nl_async is None else nl_async
         self.mnl = None
         self.nl = nl
         self._plugins = [interface, route, rule]

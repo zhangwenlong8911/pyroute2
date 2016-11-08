@@ -88,6 +88,7 @@ import struct
 import logging
 import traceback
 import threading
+import multiprocessing as mps
 
 from socket import AF_NETLINK
 from socket import SOCK_DGRAM
@@ -98,6 +99,8 @@ from socket import SO_SNDBUF
 
 from pyroute2 import config
 from pyroute2.config import SocketBase
+from pyroute2.config import MpPipe
+from pyroute2.config import MpQueue
 from pyroute2.common import AddrPool
 from pyroute2.common import DEFAULT_RCVBUF
 from pyroute2.netlink import nlmsg
@@ -304,7 +307,7 @@ class NetlinkMixin(object):
         self._fileno = fileno
         self.backlog = {0: []}
         self.callbacks = []     # [(predicate, callback, args), ...]
-        self.pthread = None
+        self.async_cache = None
         self.closed = False
         self.capabilities = {'create_bridge': config.kernel > [3, 2, 0],
                              'create_bond': config.kernel > [3, 2, 0],
@@ -342,8 +345,12 @@ class NetlinkMixin(object):
 
     def close(self):
         try:
-            os.close(self._ctrl_write)
-            os.close(self._ctrl_read)
+            if isinstance(self._ctrl_write, int):
+                os.close(self._ctrl_write)
+                os.close(self._ctrl_read)
+            else:
+                self._ctrl_write.close()
+                self._ctrl_read.close()
         except OSError:
             # ignore the case when it is closed already
             pass
@@ -903,29 +910,30 @@ class NetlinkSocket(NetlinkMixin):
             - If pid == 0, use process' pid
             - If pid == <int>, use the value instead of pid
         '''
-        if pid is not None:
-            self.port = 0
-            self.fixed = True
-            self.pid = pid or os.getpid()
+        if async != "process":
+            if pid is not None:
+                self.port = 0
+                self.fixed = True
+                self.pid = pid or os.getpid()
 
-        self.groups = groups
-        # if we have pre-defined port, use it strictly
-        if self.fixed:
-            self.epid = self.pid + (self.port << 22)
-            self._sock.bind((self.epid, self.groups))
-        else:
-            for port in range(1024):
-                try:
-                    self.port = port
-                    self.epid = self.pid + (self.port << 22)
-                    self._sock.bind((self.epid, self.groups))
-                    break
-                except Exception:
-                    # create a new underlying socket -- on kernel 4
-                    # one failed bind() makes the socket useless
-                    self.post_init()
+            self.groups = groups
+            # if we have pre-defined port, use it strictly
+            if self.fixed:
+                self.epid = self.pid + (self.port << 22)
+                self._sock.bind((self.epid, self.groups))
             else:
-                raise KeyError('no free address available')
+                for port in range(1024):
+                    try:
+                        self.port = port
+                        self.epid = self.pid + (self.port << 22)
+                        self._sock.bind((self.epid, self.groups))
+                        break
+                    except Exception:
+                        # create a new underlying socket -- on kernel 4
+                        # one failed bind() makes the socket useless
+                        self.post_init()
+                else:
+                    raise KeyError('no free address available')
         # all is OK till now, so start async recv, if we need
         if async:
             def recv_plugin(*argv, **kwarg):
@@ -945,10 +953,43 @@ class NetlinkSocket(NetlinkMixin):
             self._recv = recv_plugin
             self._recv_into = recv_into_plugin
             self.recv_ft = recv_plugin
-            self.pthread = threading.Thread(name="Netlink async cache",
-                                            target=self.async_recv)
-            self.pthread.setDaemon(True)
-            self.pthread.start()
+            if async == "process":
+                self.buffer_queue = MpQueue()
+                os.close(self._ctrl_write)
+                os.close(self._ctrl_read)
+                self._ctrl_write, self._ctrl_read = MpPipe()
+                self.async_cache = mps.Process(target=self.async_recv2,
+                                               args=(self.buffer_queue,
+                                                     self._ctrl_read,
+                                                     type(self),
+                                                     groups))
+                self.async_cache.daemon = True
+                self.async_cache.start()
+            else:
+                self.async_cache = threading.Thread(name="Netlink async cache",
+                                                    target=self.async_recv)
+                self.async_cache.setDaemon(True)
+                self.async_cache.start()
+
+    def async_recv2(self, queue, ctrl, nl_type, groups):
+        nl = nl_type()
+        nl.bind(groups=groups)
+        poll = select.poll()
+        poll.register(nl, select.POLLIN | select.POLLPRI)
+        poll.register(ctrl, select.POLLIN | select.POLLPRI)
+        sockfd = nl.fileno()
+        while True:
+            events = poll.poll()
+            for (fd, event) in events:
+                if fd == sockfd:
+                    try:
+                        data = bytearray(64000)
+                        nl.recv_into(data, 64000)
+                        queue.put(data)
+                    except Exception as e:
+                        queue.put(e)
+                else:
+                    return
 
     def close(self):
         '''
@@ -959,9 +1000,12 @@ class NetlinkSocket(NetlinkMixin):
                 return
             self.closed = True
 
-        if self.pthread:
-            os.write(self._ctrl_write, b'exit')
-            self.pthread.join()
+        if self.async_cache:
+            if isinstance(self._ctrl_write, int):
+                os.write(self._ctrl_write, b'exit')
+            else:
+                self._ctrl_write.send(b'exit')
+            self.async_cache.join()
         super(NetlinkSocket, self).close()
 
         # Common shutdown procedure
