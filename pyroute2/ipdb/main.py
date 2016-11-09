@@ -531,7 +531,6 @@ import threading
 from pyroute2 import config
 from pyroute2.common import uuid32
 from pyroute2.iproute import IPRoute
-from pyroute2.netlink.rtnl import RTM_GETLINK
 from pyroute2.netlink.rtnl.ifinfmsg import ifinfmsg
 from pyroute2.ipdb import rule
 from pyroute2.ipdb import route
@@ -814,7 +813,7 @@ class IPDB(object):
                         msg = ifinfmsg()
                         msg['index'] = 1
                         msg.reset()
-                        self.mnl.put(msg, RTM_GETLINK)
+                        self.mnl.buffer_queue.put(b' ' + b'\x00' * 31)
                     except Exception as e:
                         logging.warning("shutdown error: %s", e)
                         # Just give up.
