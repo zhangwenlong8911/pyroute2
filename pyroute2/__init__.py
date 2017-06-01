@@ -6,6 +6,7 @@
 # type matching with isinstance() and issubclass()
 #
 import sys
+import socket
 import struct
 import logging
 from abc import ABCMeta
@@ -24,6 +25,11 @@ log = logging.getLogger(__name__)
 # see https://docs.python.org/2/howto/logging.html#library-config
 if sys.version_info >= (2, 7):  # This is only available from 2.7 onwards
     log.addHandler(logging.NullHandler())
+
+try:
+    socket.inet_pton(socket.AF_INET6, '::1')
+except ValueError:
+    log.warning('IPv6 support in Python is disabled')
 
 try:
     # probe, if the bytearray can be used in struct.unpack_from()
