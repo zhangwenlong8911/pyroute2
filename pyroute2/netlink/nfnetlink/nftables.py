@@ -373,3 +373,53 @@ class NFTSocket(NetlinkSocket):
 
     def get_sets(self):
         return self.request(nfgen_msg(), NFT_MSG_GETSET)
+
+    #
+    # ACHTUNG: nftables API is a subject for future changes.
+    # Right now it is just a proof of concept. Ye warned.
+    #
+    def table(self):
+
+        msg = nft_table_msg()
+        msg['attrs'] = [['NFTA_TABLE_NAME', 'test0'],
+                        ['NFTA_TABLE_FLAGS', 0]]
+        msg['header']['type'] = 0x0a00
+        msg['header']['flags'] = 0x1
+        msg['header']['sequence_number'] = 4
+        msg['nfgen_family'] = 0x02
+
+        msg2 = nft_chain_msg()
+        msg2['attrs'] = [['NFTA_CHAIN_TABLE', 'test0'],
+                         ['NFTA_CHAIN_NAME', 'test0'],
+                         ['NFTA_CHAIN_HOOK',
+                          {'attrs': [['NFTA_HOOK_HOOKNUM', 1],
+                                     ['NFTA_HOOK_PRIORITY', 0]]}],
+                         ['NFTA_CHAIN_TYPE', 'filter']]
+        msg2['header']['type'] = 0x0a03
+        msg2['header']['flags'] = 0x401
+        msg2['header']['sequence_number'] = 4
+        msg2['nfgen_family'] = 0x02
+
+        i_msg = nfgen_msg()
+        i_msg['res_id'] = 0x0a
+        i_msg['header']['type'] = 0x10
+        i_msg['header']['flags'] = 0x1
+        i_msg['header']['sequence_number'] = 3
+
+        c_msg = nfgen_msg()
+        c_msg['res_id'] = 0x0a
+        c_msg['header']['type'] = 0x11
+        c_msg['header']['flags'] = 0x1
+        c_msg['header']['sequence_number'] = 5
+
+        i_msg.encode()
+        msg.encode()
+        msg2.encode()
+        c_msg.encode()
+
+        # The nl transaction requires all the packets to be sent at once,
+        # so we can not use self.put
+        #
+        # There will be no direct feedback from the transaction beside of
+        # the monitoring, so it should be done like in IPDB
+        self.sendto(i_msg.data + msg.data + msg2.data + c_msg.data, (0, 0))
