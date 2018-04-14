@@ -5,9 +5,10 @@ See also: pyroute2.conntrack
 """
 
 import socket
-
+from pyroute2.netlink import NLMSG_ERROR
 from pyroute2.netlink import NLM_F_REQUEST
 from pyroute2.netlink import NLM_F_DUMP
+from pyroute2.netlink import NLM_F_ACK
 from pyroute2.netlink import NETLINK_NETFILTER
 from pyroute2.netlink import nla
 from pyroute2.netlink.nlsocket import NetlinkSocket
@@ -74,6 +75,7 @@ class nfct_stats_cpu(nfgen_msg):
 
 
 class nfct_msg(nfgen_msg):
+    prefix = 'CTA_'
     nla_map = (
         ('CTA_UNSPEC', 'none'),
         ('CTA_TUPLE_ORIG', 'cta_tuple'),
@@ -262,6 +264,78 @@ class NFCTSocket(NetlinkSocket):
 
         return self.request(msg, IPCTNL_MSG_CT_GET,
                             msg_flags=NLM_F_REQUEST | NLM_F_DUMP)
+
+    def entry(self, cmd, *arg, **kwarg):
+        """
+        Get or change a conntrack entry.
+
+        Examples::
+            # set mark=5 on the matching entry
+            ct.entry('set',
+                     orig='192.168.122.1:34857',
+                     reply='192.168.122.67:5599',
+                     mark=5)
+
+            # get an entry
+            ct.entry('get',
+                     orig='192.168.122.1:34857',
+                     reply='192.168.122.67:5599')
+
+            # delete an entry
+            ct.entry('get',
+                     orig='192.168.122.1:34857',
+                     reply='192.168.122.67:5599')
+        """
+        commands = {'set': IPCTNL_MSG_CT_NEW,
+                    'add': IPCTNL_MSG_CT_NEW,
+                    'get': IPCTNL_MSG_CT_GET,
+                    'del': IPCTNL_MSG_CT_DELETE}
+        cmd = commands[cmd]
+
+        assert 'orig' in kwarg
+        assert 'reply' in kwarg
+        family = kwarg.pop('family', socket.AF_INET)
+        proto = kwarg.pop('proto', socket.IPPROTO_TCP)
+        msg = nfct_msg()
+        msg['attrs'] = []
+        if family == socket.AF_INET:
+            orig = kwarg.pop('orig').split(':')
+            reply = kwarg.pop('reply').split(':')
+            orig[1] = int(orig[1])
+            reply[1] = int(reply[1])
+            # origin -- addr:port
+            orig_nla = ['CTA_TUPLE_ORIG',
+                        {'attrs':
+                         [['CTA_TUPLE_IP',
+                           {'attrs': [['CTA_IP_V4_SRC', orig[0]],
+                                      ['CTA_IP_V4_DST', reply[0]]]}],
+                          ['CTA_TUPLE_PROTO',
+                           {'attrs': [['CTA_PROTO_NUM', proto],
+                                      ['CTA_PROTO_SRC_PORT', orig[1]],
+                                      ['CTA_PROTO_DST_PORT', reply[1]]]}]]}]
+            # reply -- addr:port
+            rply_nla = ['CTA_TUPLE_REPLY',
+                        {'attrs':
+                         [['CTA_TUPLE_IP',
+                           {'attrs': [['CTA_IP_V4_SRC', reply[0]],
+                                      ['CTA_IP_V4_DST', orig[0]]]}],
+                          ['CTA_TUPLE_PROTO',
+                           {'attrs': [['CTA_PROTO_NUM', proto],
+                                      ['CTA_PROTO_SRC_PORT', reply[1]],
+                                      ['CTA_PROTO_DST_PORT', orig[1]]]}]]}]
+            msg['attrs'].append(orig_nla)
+            msg['attrs'].append(rply_nla)
+        else:
+            raise NotImplementedError('protocol not supported')
+        #
+        for key in kwarg:
+            nla = nfct_msg.name2nla(key)
+            msg['attrs'].append([nla, kwarg[key]])
+        #
+        return self.request(msg, cmd,
+                            msg_flags=NLM_F_REQUEST | NLM_F_ACK,
+                            terminate=lambda x: x['header']['type'] ==
+                            NLMSG_ERROR)
 
     def stat(self):
         return self.request(nfct_msg(), IPCTNL_MSG_CT_GET_STATS_CPU,
