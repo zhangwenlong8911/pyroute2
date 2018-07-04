@@ -69,7 +69,6 @@ class options(nla):
                     size += struct.calcsize(field[1])
 
                 start = self.offset + size
-                end = start + (self.length - size)
+                end = self.offset + self.length
                 data = self.data[start:end]
-                # TODO: it does not work :(
-                self['opt'] = self.parse_ematch_options(self, data)(data=data)
+                self['opt'] = self.parse_ematch_options(self, data)
