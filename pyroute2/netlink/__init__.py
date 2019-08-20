@@ -610,6 +610,7 @@ class nlmsg_base(dict):
     __slots__ = (
         "_buf",
         "data",
+        "chain",
         "offset",
         "length",
         "parent",
@@ -631,7 +632,8 @@ class nlmsg_base(dict):
                  offset=0,
                  length=None,
                  parent=None,
-                 init=None):
+                 init=None,
+                 chain=None):
         global cache_jit
         dict.__init__(self)
         for i in self.fields:
@@ -640,6 +642,7 @@ class nlmsg_base(dict):
         self.data = data or bytearray()
         self.offset = offset
         self.length = length or 0
+        self.chain = chain or [self, ]
         if parent is not None:
             # some structures use parents, some not,
             # so don't create cycles without need
@@ -666,6 +669,25 @@ class nlmsg_base(dict):
         ])
         if self.header:
             self['header'] = {}
+
+    def __getattribute__(self, key):
+        if ord(key[0]) < 90:  # capital
+            refs = self.get_attrs(key)
+            if refs:
+                refs[0].chain = refs
+                return refs[0]
+            else:
+                return nlmsg_base()
+        else:
+            return dict.__getattribute__(self, key)
+
+    def __getitem__(self, key):
+        if isinstance(key, basestring):
+            return dict.__getitem__(self, key)
+        elif isinstance(key, int):
+            return self.chain[key]
+        else:
+            raise KeyError()
 
     @classmethod
     def sql_schema(cls):
