@@ -674,7 +674,8 @@ class nlmsg_base(dict):
         if ord(key[0]) < 90:  # capital
             refs = self.get_attrs(key)
             if refs:
-                refs[0].chain = refs
+                if isinstance(refs[0], nlmsg_base):
+                    refs[0].chain = refs
                 return refs[0]
             else:
                 return nlmsg_base()
