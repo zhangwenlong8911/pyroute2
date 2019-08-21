@@ -642,7 +642,7 @@ class nlmsg_base(dict):
         self.data = data or bytearray()
         self.offset = offset
         self.length = length or 0
-        self.chain = chain or [self, ]
+        self.chain = chain or [weakref.proxy(self), ]
         if parent is not None:
             # some structures use parents, some not,
             # so don't create cycles without need
