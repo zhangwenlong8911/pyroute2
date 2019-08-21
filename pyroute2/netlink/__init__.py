@@ -670,6 +670,13 @@ class nlmsg_base(dict):
         if self.header:
             self['header'] = {}
 
+    def __nonzero__(self):
+        return self.__bool__()
+
+    def __bool__(self):
+        return len(self['attrs']) > 0 or \
+            self['value'] is not NotInitialized
+
     def __getattribute__(self, key):
         if ord(key[0]) < 90:  # capital
             refs = self.get_attrs(key)
