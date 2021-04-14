@@ -1264,14 +1264,15 @@ class nlmsg_base(dict):
 
         return self
 
-    def compile_nla(self):
+    @classmethod
+    def prepare_nla_mappings(cls):
         # clean up NLA mappings
         t_nla_map = {}
         r_nla_map = {}
 
         # fix nla flags
         nla_map = []
-        for item in self.nla_map:
+        for item in cls.nla_map:
             if not isinstance(item[-1], int):
                 item = list(item)
                 item.append(0)
@@ -1306,9 +1307,9 @@ class nlmsg_base(dict):
                 init = None
             # lookup NLA class
             if nla_class == 'recursive':
-                nla_class = type(self)
+                nla_class = cls
             else:
-                nla_class = getattr(self, nla_class)
+                nla_class = getattr(cls, nla_class)
             # update mappings
             prime = {'class': nla_class,
                      'type': key,
@@ -1317,7 +1318,10 @@ class nlmsg_base(dict):
                      'nla_array': nla_array,
                      'init': init}
             t_nla_map[key] = r_nla_map[name] = prime
+        return (t_nla_map, r_nla_map)
 
+    def compile_nla(self):
+        t_nla_map, r_nla_map = self.prepare_nla_mappings()
         self.__class__.__t_nla_map = t_nla_map
         self.__class__.__r_nla_map = r_nla_map
         self.__class__.__compiled_nla = True
