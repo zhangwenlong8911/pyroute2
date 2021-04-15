@@ -1265,7 +1265,7 @@ class nlmsg_base(dict):
         return self
 
     @classmethod
-    def prepare_nla_mappings(cls):
+    def prepare_msg_mappings(cls):
         # clean up NLA mappings
         t_nla_map = {}
         r_nla_map = {}
@@ -1320,11 +1320,12 @@ class nlmsg_base(dict):
             t_nla_map[key] = r_nla_map[name] = prime
         return (t_nla_map, r_nla_map)
 
-    def compile_nla(self):
-        t_nla_map, r_nla_map = self.prepare_nla_mappings()
-        self.__class__.__t_nla_map = t_nla_map
-        self.__class__.__r_nla_map = r_nla_map
-        self.__class__.__compiled_nla = True
+    @classmethod
+    def compile_nla(cls):
+        t_nla_map, r_nla_map = cls.prepare_msg_mappings()
+        cls.__t_nla_map = t_nla_map
+        cls.__r_nla_map = r_nla_map
+        cls.__compiled_nla = True
 
     def encode_nlas(self, offset):
         '''
