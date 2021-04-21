@@ -1278,6 +1278,9 @@ class nlmsg_base(dict):
                 item.append(0)
             nla_map.append(item)
 
+        if not nla_map:
+            return (t_nla_map, r_nla_map)
+
         # detect, whether we have pre-defined keys
         if not isinstance(nla_map[0][0], int):
             # create enumeration
