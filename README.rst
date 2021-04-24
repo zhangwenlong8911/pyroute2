@@ -1,3 +1,8 @@
+Warning
+=======
+
+This is an **experimental** branch to reimplement the netlink parser core. Details: :code:`pyroute2/netlink/parser.py`
+
 Pyroute2
 ========
 
